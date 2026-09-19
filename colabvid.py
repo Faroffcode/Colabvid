@@ -317,7 +317,7 @@ def create_thumbnail(video_path, thumb_path):
     ])
     return thumb_path
 
-async def upload_to_channel(file_path, caption):
+async def upload_to_channel(file_path, caption, progress_callback=None):
     if not CHANNEL_ID:
         raise ValueError("COLABVID_CHANNEL_ID is not configured.")
 
@@ -363,6 +363,7 @@ async def upload_to_channel(file_path, caption):
             attributes=attributes,
             supports_streaming=True,
             force_document=False,
+            progress_callback=progress_callback,
         )
     finally:
         try:
@@ -444,12 +445,34 @@ async def create_clips(
         await status_message.edit(
             f"📤 Uploading clip {index}/{len(plan)}\n"
             f"📦 {output.name}\n"
+            f"📊 Uploading: 0%\n"
+            f"⚡ Speed: 0.00 MB/s\n"
             f"🔁 Retry protection: 3 attempts"
         )
+
+        upload_state = {"started": time.time(), "last_update": 0.0}
+
+        def upload_progress(sent, total):
+            now = time.time()
+            if now - upload_state["last_update"] < 2.0 and sent < total:
+                return
+            upload_state["last_update"] = now
+            elapsed = max(now - upload_state["started"], 0.001)
+            speed = sent / elapsed
+            percent = sent / total * 100 if total else 0
+            text = (
+                f"📤 Uploading clip {index}/{len(plan)}\n"
+                f"📦 {output.name}\n"
+                f"📊 {percent:.0f}% • {sent / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB\n"
+                f"⚡ Speed: {speed / 1024 / 1024:.2f} MB/s"
+            )
+            asyncio.create_task(status_message.edit(text))
+
         await retry_async(
             lambda: upload_to_channel(
                 output,
-                f"🎬 {base_name}\nPart {index:02d}/{len(plan)} • {duration}s"
+                f"🎬 {base_name}\nPart {index:02d}/{len(plan)} • {duration}s",
+                upload_progress
             ),
             attempts=3,
             label=f"Upload clip {index}"
