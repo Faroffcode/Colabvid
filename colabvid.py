@@ -57,9 +57,11 @@ def probe(path):
     result = run(["ffprobe","-v","error","-show_format","-show_streams","-of","json",str(path)], capture=True)
     data = json.loads(result.stdout)
     video = next((s for s in data.get("streams",[]) if s.get("codec_type")=="video"), None)
-    if not video: raise ValueError("The file does not contain a video stream.")
+    if not video:
+        raise ValueError("The file does not contain a video stream.")
     duration = float(data.get("format",{}).get("duration") or video.get("duration") or 0)
-    if duration <= 0: raise ValueError("Could not determine video duration.")
+    if duration <= 0:
+        raise ValueError("Could not determine video duration.")
     return {"duration":duration,"width":video.get("width"),"height":video.get("height"),"codec":video.get("codec_name")}
 
 def download_url(url, progress_callback=None):
@@ -94,21 +96,13 @@ def download_url(url, progress_callback=None):
 def make_plan(duration, target, clip_count):
     target = max(1, float(target))
     clip_count = max(1, int(clip_count))
-    available = max(0, duration - target)
+    if duration <= target:
+        return [(0, duration)]
     if clip_count == 1:
         return [(0, min(target, duration))]
-    if available <= 0:
-        return [(0, duration)]
-    max_start = available
-    starts = [
-        (max_start * i) / (clip_count - 1)
-        for i in range(clip_count)
-    ]
-    return [
-        (start, min(start + target, duration))
-        for start in starts
-    ]
-
+    max_start = duration - target
+    starts = [max_start * i / (clip_count - 1) for i in range(clip_count)]
+    return [(start, min(start + target, duration)) for start in starts]
 
 async def render_clip(source, start, end, output, progress_callback=None):
     vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
@@ -138,62 +132,6 @@ async def render_clip(source, start, end, output, progress_callback=None):
                 pass
     if await process.wait() != 0:
         raise RuntimeError(f"FFmpeg failed while creating {output.name}.")
-
-def telegram_upload(api_id, api_hash, bot_token, channel_id, file_path, caption):
-    global TELEGRAM_CLIENT
-
-    if not all([api_id, api_hash, bot_token, channel_id]):
-        raise ValueError(
-            "Telegram requires API_ID, API_HASH, BOT_TOKEN and CHANNEL_ID."
-        )
-
-    from telethon import TelegramClient
-
-    if TELEGRAM_CLIENT is None:
-        TELEGRAM_CLIENT = TelegramClient(
-            str(ROOT / "telegram_session"),
-            int(api_id),
-            api_hash,
-        )
-        TELEGRAM_CLIENT.start(bot_token=bot_token)
-
-    return TELEGRAM_CLIENT.send_file(
-        channel_id,
-        str(file_path),
-        caption=caption[:1024],
-        video=True,
-        supports_streaming=True,
-    )
-
-
-
-def make_plan(duration, target, clip_count):
-    target = max(1, float(target))
-    clip_count = max(1, int(clip_count))
-    if duration <= target:
-        return [(0, duration)]
-    if clip_count == 1:
-        return [(0, min(target, duration))]
-    max_start = duration - target
-    starts = [max_start * i / (clip_count - 1) for i in range(clip_count)]
-    return [(start, min(start + target, duration)) for start in starts]
-
-
-def duration_buttons():
-    values = [15, 30, 45, 60, 90, 120]
-    return [
-        [Button.inline(f"{v}s", f"duration:{v}") for v in values[:3]],
-        [Button.inline(f"{v}s", f"duration:{v}") for v in values[3:]],
-    ]
-
-
-def clip_buttons():
-    values = [1, 5, 10, 15, 20, 30, 50, 100]
-    return [
-        [Button.inline(str(v), f"clips:{v}") for v in values[:4]],
-        [Button.inline(str(v), f"clips:{v}") for v in values[4:]],
-    ]
-
 
 async def upload_to_channel(file_path, caption):
     if not CHANNEL_ID:
@@ -252,7 +190,6 @@ async def create_clips(chat_id, source, duration, clip_count, status_message):
     await status_message.edit(
         f"✅ Finished!\nUploaded {len(plan)} clips to the Telegram channel."
     )
-
 
 async def start_bot():
     global BOT
@@ -335,14 +272,14 @@ async def start_bot():
         )
 
         try:
+            loop = asyncio.get_running_loop()
             last_download_update = [0.0]
 
             def download_progress(downloaded, total, speed):
                 now = time.time()
-                if now - last_download_update[0] < 1.0 and not (total and downloaded >= total):
+                if now - last_download_update[0] < 4.0 and not (total and downloaded >= total):
                     return
                 last_download_update[0] = now
-                loop = asyncio.get_running_loop()
                 if total:
                     text = (
                         f"⬇️ Downloading source\n"
