@@ -186,12 +186,24 @@ def clip_buttons():
 async def upload_to_channel(file_path, caption):
     if not CHANNEL_ID:
         raise ValueError("COLABVID_CHANNEL_ID is not configured.")
+
+    target = CHANNEL_ID.strip()
+    try:
+        if target.lstrip("-").isdigit():
+            target = int(target)
+        else:
+            target = await BOT.get_entity(target.lstrip("@"))
+    except Exception as e:
+        raise ValueError(
+            "CHANNEL_ID must be the numeric Telegram channel ID, usually starting with -100."
+        ) from e
+
     await BOT.send_file(
-        CHANNEL_ID, str(file_path),
+        target,
+        str(file_path),
         caption=caption[:1024],
         supports_streaming=True,
     )
-
 
 async def create_clips(chat_id, source, duration, clip_count, status_message):
     media = probe(source)
