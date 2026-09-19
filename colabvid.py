@@ -184,6 +184,7 @@ def duration_buttons():
     return [
         [Button.inline(f"{v}s", f"duration:{v}") for v in values[:3]],
         [Button.inline(f"{v}s", f"duration:{v}") for v in values[3:]],
+        [Button.inline("✏️ Custom", "duration:custom")],
     ]
 
 def clip_buttons():
@@ -191,6 +192,7 @@ def clip_buttons():
     return [
         [Button.inline(str(v), f"clips:{v}") for v in values[:4]],
         [Button.inline(str(v), f"clips:{v}") for v in values[4:]],
+        [Button.inline("✏️ Custom", "clips:custom")],
     ]
 
 def sanitize_filename(name):
@@ -549,6 +551,32 @@ async def start_bot():
                 await event.respond(f"❌ Could not resume job: {type(e).__name__}: {e}")
             return
 
+        if event.chat_id in USER_JOBS and USER_JOBS[event.chat_id].get("awaiting_custom_duration"):
+            try:
+                duration = int(re.sub(r"[^0-9]", "", text))
+                if duration < 1 or duration > 3600:
+                    raise ValueError("Custom duration must be between 1 and 3600 seconds.")
+                job = USER_JOBS[event.chat_id]
+                job["duration"] = duration
+                job["awaiting_custom_duration"] = False
+                await event.respond(f"✅ Custom reel duration: {duration}s\n\nNow select the number of clips:", buttons=clip_buttons())
+            except Exception as e:
+                await event.respond(f"❌ {e}\n\nSend the duration again, for example: 75")
+            return
+
+        if event.chat_id in USER_JOBS and USER_JOBS[event.chat_id].get("awaiting_custom_clips"):
+            try:
+                clip_count = int(text.strip())
+                if clip_count < 1 or clip_count > 1000:
+                    raise ValueError("Custom clip count must be between 1 and 1000.")
+                job = USER_JOBS[event.chat_id]
+                job["clip_count"] = clip_count
+                job["awaiting_custom_clips"] = False
+                await process_selected_clips(event, clip_count)
+            except Exception as e:
+                await event.respond(f"❌ {e}\n\nSend a number between 1 and 1000.")
+            return
+
         if event.chat_id in USER_JOBS and USER_JOBS[event.chat_id].get("awaiting_name"):
             try:
                 name = sanitize_filename(text)
@@ -598,14 +626,19 @@ async def start_bot():
             log(f"URL inspection error: {type(e).__name__}: {e}")
             await status.edit(f"❌ {type(e).__name__}: {e}")
 
-    @BOT.on(events.CallbackQuery(pattern=rb"duration:(\d+)"))
+    @BOT.on(events.CallbackQuery(pattern=rb"duration:(\d+|custom)"))
     async def on_duration(event):
         chat_id = event.chat_id
         job = USER_JOBS.get(chat_id)
         if not job:
             await event.answer("Send a video URL first.", alert=True)
             return
-        duration = int(event.pattern_match.group(1))
+        value = event.pattern_match.group(1).decode()
+        if value == "custom":
+            job["awaiting_custom_duration"] = True
+            await event.edit("✏️ Enter the custom reel duration in seconds (1–3600):")
+            return
+        duration = int(value)
         job["duration"] = duration
         log(f"Chat {chat_id} selected duration: {duration}s")
         await event.edit(
@@ -614,15 +647,27 @@ async def start_bot():
             buttons=clip_buttons()
         )
 
-    @BOT.on(events.CallbackQuery(pattern=rb"clips:(\d+)"))
+    @BOT.on(events.CallbackQuery(pattern=rb"clips:(\d+|custom)"))
     async def on_clips(event):
         chat_id = event.chat_id
         job = USER_JOBS.get(chat_id)
         if not job or "duration" not in job:
             await event.answer("Send a video URL first.", alert=True)
             return
+        value = event.pattern_match.group(1).decode()
+        if value == "custom":
+            job["awaiting_custom_clips"] = True
+            await event.edit("✏️ Enter the number of clips you want (1–1000):")
+            return
+        await process_selected_clips(event, int(value))
 
-        clip_count = int(event.pattern_match.group(1))
+    async def process_selected_clips(event, clip_count):
+        chat_id = event.chat_id
+        job = USER_JOBS.get(chat_id)
+        if not job or "duration" not in job:
+            await event.answer("Send a video URL first.", alert=True)
+            return
+
         job["clip_count"] = clip_count
         log(f"Chat {chat_id} selected {clip_count} clips at {job['duration']}s")
 
