@@ -159,7 +159,7 @@ def download_url(url, progress_callback=None):
                 downloaded += len(chunk)
                 now = time.time()
                 if progress_callback and (
-                    now - last_update >= 4.0 or (total and downloaded >= total)
+                    now - last_update >= 2.0 or (total and downloaded >= total)
                 ):
                     speed = downloaded / max(now - started, 0.001)
                     progress_callback(downloaded, total, speed)
@@ -252,7 +252,7 @@ async def render_clip(source, start, end, output, progress_callback=None):
                 elapsed = int(text.split("=", 1)[1]) / 1_000_000
                 percent = min(100, elapsed / duration * 100)
                 now = time.time()
-                if progress_callback and (now - last_update >= 4.0 or percent >= 100):
+                if progress_callback and (now - last_update >= 2.0 or percent >= 100):
                     await progress_callback(percent, elapsed, duration)
                     last_update = now
             except ValueError:
@@ -645,7 +645,7 @@ async def start_bot():
             def download_progress(downloaded, total, speed):
                 now = time.time()
                 if (
-                    now - last_download_update[0] < 4.0
+                    now - last_download_update[0] < 2.0
                     and not (total and downloaded >= total)
                 ):
                     return
