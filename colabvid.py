@@ -25,6 +25,23 @@ def log(message):
 def run(args, capture=False):
     return subprocess.run([str(x) for x in args], check=True, text=True, capture_output=capture)
 
+def detect_video_encoder():
+    """Use NVIDIA NVENC when available; otherwise fall back to CPU libx264."""
+    try:
+        result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], check=True, text=True, capture_output=True)
+        if "h264_nvenc" in result.stdout:
+            try:
+                subprocess.run(["nvidia-smi", "-L"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                log("NVIDIA GPU detected; using h264_nvenc.")
+                return "nvenc"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    log("NVIDIA NVENC unavailable; using CPU libx264.")
+    return "cpu"
+
+
 def inspect_url(url):
     url = url.strip()
     if not re.match(r"^https?://", url, re.I):
@@ -129,9 +146,13 @@ async def render_clip(source, start, end, output, progress_callback=None):
     vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"
     duration = max(0.1, end - start)
     log(f"Clipping: {output.name} ({start:.1f}s -> {end:.1f}s)")
+    encoder = detect_video_encoder()
+    if encoder == "nvenc":
+        video_args = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+    else:
+        video_args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
     cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(source), "-t", str(duration),
-           "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+           "-vf", vf, *video_args, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
            "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(output)]
     process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     last_update = 0.0
