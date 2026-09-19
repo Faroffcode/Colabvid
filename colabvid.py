@@ -3,6 +3,7 @@ from pathlib import Path
 from urllib.parse import urlparse, unquote
 import requests
 from telethon import TelegramClient, events, Button
+from telethon.tl.types import DocumentAttributeVideo
 
 ROOT = Path("/content/colabvid")
 DOWNLOADS = ROOT / "downloads"
@@ -65,7 +66,7 @@ def probe(path):
     duration = float(data.get("format",{}).get("duration") or video.get("duration") or 0)
     if duration <= 0:
         raise ValueError("Could not determine video duration.")
-    return {"duration":duration,"width":video.get("width"),"height":video.get("height"),"codec":video.get("codec_name")}
+    return {"duration":duration,"width":int(video.get("width") or 1080),"height":int(video.get("height") or 1920),"codec":video.get("codec_name")}
 
 def download_url(url, progress_callback=None):
     info = inspect_url(url)
@@ -132,9 +133,7 @@ async def render_clip(source, start, end, output, progress_callback=None):
            "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
            "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(output)]
-    process = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
-    )
+    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     last_update = 0.0
     while True:
         line = await process.stdout.readline()
@@ -155,9 +154,19 @@ async def render_clip(source, start, end, output, progress_callback=None):
         raise RuntimeError(f"FFmpeg failed while creating {output.name}.")
     log(f"Clip complete: {output}")
 
+def create_thumbnail(video_path, thumb_path):
+    # Telegram works best with a JPEG thumbnail; generate it from ~1 second in.
+    run([
+        "ffmpeg", "-y", "-ss", "1", "-i", str(video_path),
+        "-frames:v", "1", "-vf", "scale=320:-1",
+        "-q:v", "4", str(thumb_path)
+    ])
+    return thumb_path
+
 async def upload_to_channel(file_path, caption):
     if not CHANNEL_ID:
         raise ValueError("COLABVID_CHANNEL_ID is not configured.")
+
     target = CHANNEL_ID.strip()
     try:
         if target.lstrip("-").isdigit():
@@ -166,8 +175,42 @@ async def upload_to_channel(file_path, caption):
             target = await BOT.get_entity(target.lstrip("@"))
     except Exception as e:
         raise ValueError("CHANNEL_ID must be the numeric Telegram channel ID, usually starting with -100.") from e
-    log(f"Uploading: {file_path.name}")
-    await BOT.send_file(target, str(file_path), caption=caption[:1024], supports_streaming=True)
+
+    media = probe(file_path)
+    duration = max(1, int(round(media["duration"])))
+    width = media["width"]
+    height = media["height"]
+
+    thumb = file_path.with_suffix(".jpg")
+    create_thumbnail(file_path, thumb)
+
+    log(f"Uploading: {file_path.name} | duration={duration}s | {width}x{height} | thumbnail={thumb.name}")
+
+    attributes = [
+        DocumentAttributeVideo(
+            duration=duration,
+            w=width,
+            h=height,
+            supports_streaming=True,
+        )
+    ]
+
+    try:
+        await BOT.send_file(
+            target,
+            str(file_path),
+            caption=caption[:1024],
+            thumb=str(thumb),
+            attributes=attributes,
+            supports_streaming=True,
+            force_document=False,
+        )
+    finally:
+        try:
+            thumb.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     log(f"Upload complete: {file_path.name}")
 
 async def create_clips(chat_id, source, duration, clip_count, status_message):
@@ -177,20 +220,13 @@ async def create_clips(chat_id, source, duration, clip_count, status_message):
     job_dir.mkdir(parents=True, exist_ok=True)
     log(f"Processing job: {len(plan)} clips x {duration}s from {media['duration']:.1f}s")
 
-    await status_message.edit(
-        f"📥 Download complete\n🎬 Source: {media['duration'] / 60:.1f} min\n"
-        f"✂️ Preparing {len(plan)} clips × {duration}s..."
-    )
+    await status_message.edit(f"📥 Download complete\n🎬 Source: {media['duration'] / 60:.1f} min\n✂️ Preparing {len(plan)} clips × {duration}s...")
 
     for index, (start, end) in enumerate(plan, 1):
         output = job_dir / f"Part_{index:02d}.mp4"
 
         async def render_status(percent, elapsed, total):
-            await status_message.edit(
-                f"🎬 Clipping {index}/{len(plan)}\n"
-                f"📊 Progress: {percent:.0f}%\n"
-                f"⏱ {elapsed:.0f}s / {total:.0f}s"
-            )
+            await status_message.edit(f"🎬 Clipping {index}/{len(plan)}\n📊 Progress: {percent:.0f}%\n⏱ {elapsed:.0f}s / {total:.0f}s")
             log(f"Clipping {index}/{len(plan)}: {percent:.0f}%")
 
         await status_message.edit(f"🎬 Clipping {index}/{len(plan)}\n⏱ {end - start:.0f}s")
@@ -221,10 +257,7 @@ async def start_bot():
         log(f"Message received from chat {event.chat_id}: {text[:120]}")
 
         if text in ("/start", "/help"):
-            await event.respond(
-                "🎬 Colabvid Bot\n\nSend me a public video URL.\n"
-                "Then choose reel duration and number of clips."
-            )
+            await event.respond("🎬 Colabvid Bot\n\nSend me a public video URL.\nThen choose reel duration and number of clips.")
             return
 
         if not re.match(r"^https?://", text, re.I):
@@ -268,10 +301,7 @@ async def start_bot():
         clip_count = int(event.pattern_match.group(1))
         job["clip_count"] = clip_count
         log(f"Chat {chat_id} selected {clip_count} clips at {job['duration']}s")
-        await event.edit(
-            f"🚀 Starting...\n\n🎞 Reel duration: {job['duration']}s\n"
-            f"🔢 Clips: {clip_count}\n\nDownloading and processing now..."
-        )
+        await event.edit(f"🚀 Starting...\n\n🎞 Reel duration: {job['duration']}s\n🔢 Clips: {clip_count}\n\nDownloading and processing now...")
         try:
             loop = asyncio.get_running_loop()
             last_download_update = [0.0]
@@ -282,11 +312,7 @@ async def start_bot():
                     return
                 last_download_update[0] = now
                 if total:
-                    text = (
-                        f"⬇️ Downloading source\n📊 {downloaded / total * 100:.0f}% • "
-                        f"{downloaded / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB\n"
-                        f"⚡ {speed / 1024 / 1024:.2f} MB/s"
-                    )
+                    text = f"⬇️ Downloading source\n📊 {downloaded / total * 100:.0f}% • {downloaded / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB\n⚡ {speed / 1024 / 1024:.2f} MB/s"
                 else:
                     text = f"⬇️ Downloading source\n📦 {downloaded / 1024 / 1024:.1f} MB\n⚡ {speed / 1024 / 1024:.2f} MB/s"
                 asyncio.run_coroutine_threadsafe(event.edit(text), loop)
