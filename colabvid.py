@@ -272,7 +272,7 @@ async def start_bot():
         except Exception as e:
             await status.edit(f"❌ {type(e).__name__}: {e}")
 
-    @BOT.on(events.CallbackQuery(pattern=rb"duration:(\\d+)"))
+    @BOT.on(events.CallbackQuery(pattern=rb"duration:(\d+)"))
     async def on_duration(event):
         chat_id = event.chat_id
         job = USER_JOBS.get(chat_id)
@@ -286,7 +286,7 @@ async def start_bot():
             buttons=clip_buttons(),
         )
 
-    @BOT.on(events.CallbackQuery(pattern=rb"clips:(\\d+)"))
+    @BOT.on(events.CallbackQuery(pattern=rb"clips:(\d+)"))
     async def on_clips(event):
         chat_id = event.chat_id
         job = USER_JOBS.get(chat_id)
