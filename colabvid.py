@@ -272,6 +272,41 @@ async def render_clip(source, start, end, output, progress_callback=None):
 
     log(f"Clip complete: {output}")
 
+async def retry_async(operation, attempts=3, label="operation"):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except Exception as e:
+            last_error = e
+            if attempt >= attempts:
+                break
+            delay = attempt * 2
+            log(f"{label} failed (attempt {attempt}/{attempts}): {e}. Retrying in {delay}s...")
+            await asyncio.sleep(delay)
+    raise last_error
+
+
+def cleanup_path(path):
+    try:
+        path = Path(path)
+        if path.is_dir():
+            import shutil
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except Exception as e:
+        log(f"Cleanup warning for {path}: {e}")
+
+
+def save_job_manifest(manifest_path, data):
+    manifest_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def load_job_manifest(manifest_path):
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
 def create_thumbnail(video_path, thumb_path):
     run([
         "ffmpeg", "-y", "-ss", "1", "-i", str(video_path),
@@ -335,44 +370,111 @@ async def upload_to_channel(file_path, caption):
 
     log(f"Upload complete: {file_path.name}")
 
-async def create_clips(chat_id, source, duration, clip_count, status_message, base_name):
+async def create_clips(
+    chat_id, source, duration, clip_count, status_message, base_name,
+    job_dir=None, manifest_path=None, manifest=None
+):
     media = probe(source)
     plan = make_plan(media["duration"], duration, clip_count)
-    job_dir = OUTPUTS / f"{chat_id}_{time.strftime('%Y%m%d_%H%M%S')}"
+    if job_dir is None:
+        job_dir = OUTPUTS / f"{chat_id}_{time.strftime('%Y%m%d_%H%M%S')}"
     job_dir.mkdir(parents=True, exist_ok=True)
-    log(f"Processing job: {len(plan)} clips x {duration}s from {media['duration']:.1f}s")
+
+    if manifest is None:
+        manifest = {
+            "chat_id": chat_id,
+            "source": str(source),
+            "base_name": base_name,
+            "duration": duration,
+            "clip_count": clip_count,
+            "plan": plan,
+            "completed": []
+        }
+    if manifest_path is None:
+        manifest_path = job_dir / "job.json"
+    save_job_manifest(manifest_path, manifest)
+
+    completed = set(manifest.get("completed", []))
+    log(
+        f"Processing job: {len(plan)} clips x {duration}s from "
+        f"{media['duration']:.1f}s ({len(completed)}/{len(plan)} already complete)"
+    )
 
     await status_message.edit(
         f"📥 Download complete\n"
         f"🎬 Source: {media['duration'] / 60:.1f} min\n"
-        f"✂️ Preparing {len(plan)} clips × {duration}s..."
+        f"✂️ {len(plan)} clips × {duration}s\n"
+        f"✅ Resuming: {len(completed)}/{len(plan)} complete"
     )
 
     for index, (start, end) in enumerate(plan, 1):
         output = job_dir / f"{base_name} {index:02d}.mp4"
 
+        if index in completed:
+            log(f"Resume: skipping completed clip {index}/{len(plan)}")
+            continue
+
         async def render_status(percent, elapsed, total):
             await status_message.edit(
-                f"🎬 Clipping {index}/{len(plan)}\n"
-                f"📊 Progress: {percent:.0f}%\n"
-                f"⏱ {elapsed:.0f}s / {total:.0f}s"
+                f"🎬 Clip {index}/{len(plan)}\n"
+                f"📊 Encoding: {percent:.0f}%\n"
+                f"⏱ {elapsed:.0f}s / {total:.0f}s\n"
+                f"✅ Uploaded: {len(completed)}/{len(plan)}"
             )
             log(f"Clipping {index}/{len(plan)}: {percent:.0f}%")
 
         await status_message.edit(
-            f"🎬 Clipping {index}/{len(plan)}\n"
-            f"⏱ {end - start:.0f}s"
+            f"🎬 Clip {index}/{len(plan)}\n"
+            f"📍 {start:.0f}s → {end:.0f}s\n"
+            f"📊 Encoding: 0%\n"
+            f"✅ Uploaded: {len(completed)}/{len(plan)}"
         )
-        await render_clip(source, start, end, output, render_status)
+
+        if output.exists() and output.stat().st_size > 0:
+            log(f"Resume: reusing existing output {output.name}")
+        else:
+            await retry_async(
+                lambda: render_clip(source, start, end, output, render_status),
+                attempts=3,
+                label=f"Render clip {index}"
+            )
+
         await status_message.edit(
-            f"📤 Uploading {index}/{len(plan)}...\n"
-            f"✅ Clip {index} ready"
+            f"📤 Uploading clip {index}/{len(plan)}\n"
+            f"📦 {output.name}\n"
+            f"🔁 Retry protection: 3 attempts"
         )
-        await upload_to_channel(output, f"Part {index:02d} • {duration}s")
+        await retry_async(
+            lambda: upload_to_channel(
+                output,
+                f"🎬 {base_name}\nPart {index:02d}/{len(plan)} • {duration}s"
+            ),
+            attempts=3,
+            label=f"Upload clip {index}"
+        )
+
+        completed.add(index)
+        manifest["completed"] = sorted(completed)
+        save_job_manifest(manifest_path, manifest)
+
+        await status_message.edit(
+            f"✅ Clip {index}/{len(plan)} uploaded\n"
+            f"📈 Overall: {len(completed)}/{len(plan)} complete"
+        )
 
     log(f"Job complete: uploaded {len(plan)} clips")
     await status_message.edit(
-        f"✅ Finished!\nUploaded {len(plan)} clips to the Telegram channel."
+        f"✅ Finished!\n"
+        f"Uploaded {len(plan)} clips to the Telegram channel.\n"
+        f"🧹 Cleaning temporary files..."
+    )
+    cleanup_path(source)
+    cleanup_path(job_dir)
+    log("Source and temporary output files cleaned up after successful upload.")
+    await status_message.edit(
+        f"✅ Finished!\n"
+        f"Uploaded {len(plan)} clips to the Telegram channel.\n"
+        f"🧹 Temporary files cleaned up."
     )
 
 async def start_bot():
@@ -402,8 +504,49 @@ async def start_bot():
             await event.respond(
                 "🎬 Colabvid Bot\n\n"
                 "Send me a public video URL.\n"
-                "Then choose reel duration and number of clips."
+                "Then choose reel duration and number of clips.\n\n"
+                "♻️ Failed jobs keep their progress until they finish."
             )
+            return
+
+        if text == "/resume":
+            candidates = sorted(
+                OUTPUTS.glob(f"{event.chat_id}_*/job.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+            if not candidates:
+                await event.respond("ℹ️ No resumable job was found.")
+                return
+
+            manifest_path = candidates[0]
+            try:
+                manifest = load_job_manifest(manifest_path)
+                source = Path(manifest["source"])
+                if not source.exists():
+                    raise FileNotFoundError("The downloaded source file is no longer available.")
+
+                completed = set(manifest.get("completed", []))
+                total = len(manifest["plan"])
+                status = await event.respond(
+                    f"♻️ Resuming job...\n"
+                    f"📝 {manifest['base_name']}.mp4\n"
+                    f"📈 {len(completed)}/{total} clips already complete"
+                )
+                await create_clips(
+                    event.chat_id,
+                    source,
+                    manifest["duration"],
+                    manifest["clip_count"],
+                    status,
+                    manifest["base_name"],
+                    manifest_path.parent,
+                    manifest_path,
+                    manifest
+                )
+            except Exception as e:
+                log(f"Resume error: {type(e).__name__}: {e}")
+                await event.respond(f"❌ Could not resume job: {type(e).__name__}: {e}")
             return
 
         if event.chat_id in USER_JOBS and USER_JOBS[event.chat_id].get("awaiting_name"):
@@ -524,16 +667,43 @@ async def start_bot():
 
                 asyncio.run_coroutine_threadsafe(event.edit(text), loop)
 
-            source, _ = await asyncio.to_thread(
-                download_url, job["url"], download_progress
+            source, _ = await retry_async(
+                lambda: asyncio.to_thread(
+                    download_url, job["url"], download_progress
+                ),
+                attempts=3,
+                label="Source download"
             )
+
+            media = probe(source)
+            job_dir = OUTPUTS / f"{chat_id}_{time.strftime('%Y%m%d_%H%M%S')}"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            manifest_path = job_dir / "job.json"
+            manifest = {
+                "chat_id": chat_id,
+                "source": str(source),
+                "url": job["url"],
+                "resolved": job.get("resolved"),
+                "base_name": job["name"],
+                "duration": job["duration"],
+                "clip_count": clip_count,
+                "source_duration": media["duration"],
+                "plan": make_plan(media["duration"], job["duration"], clip_count),
+                "completed": []
+            }
+            save_job_manifest(manifest_path, manifest)
+
             await create_clips(
                 chat_id, source, job["duration"], clip_count,
-                event, job["name"]
+                event, job["name"], job_dir, manifest_path, manifest
             )
         except Exception as e:
             log(f"Job error: {type(e).__name__}: {e}")
-            await event.edit(f"❌ {type(e).__name__}: {e}")
+            await event.edit(
+                f"❌ Job paused: {type(e).__name__}\n"
+                f"{e}\n\n"
+                f"♻️ Progress is saved. Send /resume to continue."
+            )
         finally:
             USER_JOBS.pop(chat_id, None)
 
