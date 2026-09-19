@@ -142,6 +142,14 @@ def clip_buttons():
         [Button.inline(str(v), f"clips:{v}") for v in values[4:]],
     ]
 
+def sanitize_filename(name):
+    name = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", name.strip())
+    name = re.sub(r"[\\/:*?"<>|\x00-\x1f]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    if not name:
+        raise ValueError("File name cannot be empty.")
+    return name[:120]
+
 async def render_clip(source, start, end, output, progress_callback=None):
     vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"
     duration = max(0.1, end - start)
@@ -234,7 +242,7 @@ async def upload_to_channel(file_path, caption):
 
     log(f"Upload complete: {file_path.name}")
 
-async def create_clips(chat_id, source, duration, clip_count, status_message):
+async def create_clips(chat_id, source, duration, clip_count, status_message, base_name):
     media = probe(source)
     plan = make_plan(media["duration"], duration, clip_count)
     job_dir = OUTPUTS / f"{chat_id}_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -244,7 +252,7 @@ async def create_clips(chat_id, source, duration, clip_count, status_message):
     await status_message.edit(f"📥 Download complete\n🎬 Source: {media['duration'] / 60:.1f} min\n✂️ Preparing {len(plan)} clips × {duration}s...")
 
     for index, (start, end) in enumerate(plan, 1):
-        output = job_dir / f"Part_{index:02d}.mp4"
+        output = job_dir / f"{base_name} {index:02d}.mp4"
 
         async def render_status(percent, elapsed, total):
             await status_message.edit(f"🎬 Clipping {index}/{len(plan)}\n📊 Progress: {percent:.0f}%\n⏱ {elapsed:.0f}s / {total:.0f}s")
@@ -281,6 +289,16 @@ async def start_bot():
             await event.respond("🎬 Colabvid Bot\n\nSend me a public video URL.\nThen choose reel duration and number of clips.")
             return
 
+        if event.chat_id in USER_JOBS and USER_JOBS[event.chat_id].get("awaiting_name"):
+            try:
+                name = sanitize_filename(text)
+                USER_JOBS[event.chat_id]["name"] = name
+                USER_JOBS[event.chat_id]["awaiting_name"] = False
+                await event.respond(f"✅ File name: {name}.mp4\n\nSelect your Instagram Reel duration:", buttons=duration_buttons())
+            except Exception as e:
+                await event.respond(f"❌ {e}\n\nSend the file name again (without extension).")
+            return
+
         if not re.match(r"^https?://", text, re.I):
             await event.respond("📎 Send a video URL starting with http:// or https://")
             return
@@ -294,8 +312,8 @@ async def start_bot():
                 if info["kind"] == "page":
                     raise ValueError("I couldn't find a normal public direct video URL on that page.")
                 resolved = text
-            USER_JOBS[event.chat_id] = {"url": text, "resolved": resolved, "info": info}
-            await status.edit("✅ URL inspected.\n\nSelect your Instagram Reel duration:", buttons=duration_buttons())
+            USER_JOBS[event.chat_id] = {"url": text, "resolved": resolved, "info": info, "awaiting_name": True}
+            await status.edit("✅ URL inspected.\n\n📝 Send the file name you want to use (without extension).")
         except Exception as e:
             log(f"URL inspection error: {type(e).__name__}: {e}")
             await status.edit(f"❌ {type(e).__name__}: {e}")
@@ -322,7 +340,10 @@ async def start_bot():
         clip_count = int(event.pattern_match.group(1))
         job["clip_count"] = clip_count
         log(f"Chat {chat_id} selected {clip_count} clips at {job['duration']}s")
-        await event.edit(f"🚀 Starting...\n\n🎞 Reel duration: {job['duration']}s\n🔢 Clips: {clip_count}\n\nDownloading and processing now...")
+        if not job.get("name"):
+            await event.answer("Send the file name first.", alert=True)
+            return
+        await event.edit(f"🚀 Starting...\n\n📝 File: {job['name']}.mp4\n🎞 Reel duration: {job['duration']}s\n🔢 Clips: {clip_count}\n\nDownloading and processing now...")
         try:
             loop = asyncio.get_running_loop()
             last_download_update = [0.0]
@@ -339,7 +360,7 @@ async def start_bot():
                 asyncio.run_coroutine_threadsafe(event.edit(text), loop)
 
             source, _ = await asyncio.to_thread(download_url, job["url"], download_progress)
-            await create_clips(chat_id, source, job["duration"], clip_count, event)
+            await create_clips(chat_id, source, job["duration"], clip_count, event, job["name"])
         except Exception as e:
             log(f"Job error: {type(e).__name__}: {e}")
             await event.edit(f"❌ {type(e).__name__}: {e}")
