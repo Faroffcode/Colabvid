@@ -177,12 +177,22 @@ def download_url(url, progress):
     return destination, media
 
 
-def make_plan(duration, target):
+def make_plan(duration, target, clip_count):
     target = max(1, float(target))
+    clip_count = max(1, int(clip_count))
+    available = max(0, duration - target)
+    if clip_count == 1:
+        return [(0, min(target, duration))]
+    if available <= 0:
+        return [(0, duration)]
+    max_start = available
+    starts = [
+        (max_start * i) / (clip_count - 1)
+        for i in range(clip_count)
+    ]
     return [
-        (x, min(x + target, duration))
-        for x in [i * target for i in range(int(duration // target) + 1)]
-        if x < duration
+        (start, min(start + target, duration))
+        for start in starts
     ]
 
 
@@ -233,7 +243,7 @@ def telegram_upload(api_id, api_hash, bot_token, channel_id, file_path, caption)
 
 def process(
     source_mode, upload, url,
-    target, send_telegram,
+    target, clip_count, send_telegram,
     api_id, api_hash, bot_token, channel_id,
     caption_template,
     progress=gr.Progress(),
@@ -250,7 +260,7 @@ def process(
             source, media = download_url(url, progress)
 
         duration = media["duration"]
-        plan = make_plan(duration, float(target))
+        plan = make_plan(duration, float(target), int(clip_count))
 
         if not plan:
             raise ValueError("No clips could be created.")
@@ -308,8 +318,12 @@ def ui():
                     visible=True,
                 )
                 target = gr.Slider(
-                    15, 180, value=60, step=5,
-                    label="Clip duration (seconds)",
+                    15, 180, value=30, step=5,
+                    label="Reel duration (seconds)",
+                )
+                clip_count = gr.Slider(
+                    1, 100, value=10, step=1,
+                    label="Number of clips",
                 )
 
             with gr.Column():
@@ -338,7 +352,7 @@ def ui():
         create.click(
             process,
             inputs=[
-                source_mode, upload, url, target,
+                source_mode, upload, url, target, clip_count,
                 send_telegram, api_id, api_hash, bot_token,
                 channel_id, caption,
             ],
