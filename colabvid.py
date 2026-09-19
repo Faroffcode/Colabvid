@@ -98,23 +98,33 @@ def make_plan(duration, target, clip_count):
     ]
 
 
-def render_clip(source, start, end, output):
+async def render_clip(source, start, end, output, progress_callback=None):
     vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-
-    run([
-        "ffmpeg", "-y",
-        "-ss", start, "-i", source,
-        "-t", end - start,
-        "-vf", vf,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        str(output),
-    ])
+    duration = max(0.1, end - start)
+    cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(source), "-t", str(duration),
+           "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+           "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+           "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(output)]
+    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.DEVNULL)
+    last_update = 0.0
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        text = line.decode("utf-8", "ignore").strip()
+        if text.startswith("out_time_ms="):
+            try:
+                elapsed = int(text.split("=", 1)[1]) / 1_000_000
+                percent = min(100, elapsed / duration * 100)
+                now = time.time()
+                if progress_callback and (now - last_update >= 0.8 or percent >= 100):
+                    await progress_callback(percent, elapsed, duration)
+                    last_update = now
+            except ValueError:
+                pass
+    if await process.wait() != 0:
+        raise RuntimeError(f"FFmpeg failed while creating {output.name}.")
 
 def telegram_upload(api_id, api_hash, bot_token, channel_id, file_path, caption):
     global TELEGRAM_CLIENT
@@ -208,23 +218,32 @@ async def upload_to_channel(file_path, caption):
 async def create_clips(chat_id, source, duration, clip_count, status_message):
     media = probe(source)
     plan = make_plan(media["duration"], duration, clip_count)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    job_dir = OUTPUTS / f"{chat_id}_{timestamp}"
+    job_dir = OUTPUTS / f"{chat_id}_{time.strftime('%Y%m%d_%H%M%S')}"
     job_dir.mkdir(parents=True, exist_ok=True)
 
     await status_message.edit(
-        f"⬇️ Source ready\n🎬 Movie: {media['duration'] / 60:.1f} min\n"
-        f"✂️ Creating {len(plan)} clips × {duration}s..."
+        f"📥 Download complete\n🎬 Source: {media['duration'] / 60:.1f} min\n"
+        f"✂️ Preparing {len(plan)} clips × {duration}s..."
     )
 
     for index, (start, end) in enumerate(plan, 1):
         output = job_dir / f"Part_{index:02d}.mp4"
+
+        async def render_status(percent, elapsed, total):
+            await status_message.edit(
+                f"🎬 Clipping {index}/{len(plan)}\n"
+                f"📊 Progress: {percent:.0f}%\n"
+                f"⏱ {elapsed:.0f}s / {total:.0f}s"
+            )
+
         await status_message.edit(
-            f"🎬 Rendering clip {index}/{len(plan)}\n⏱ {end - start:.0f}s"
+            f"🎬 Clipping {index}/{len(plan)}\n⏱ {end - start:.0f}s"
         )
-        await asyncio.to_thread(render_clip, source, start, end, output)
+        await render_clip(source, start, end, output, render_status)
+
         await status_message.edit(
-            f"📤 Uploading clip {index}/{len(plan)} to Telegram..."
+            f"📤 Uploading {index}/{len(plan)}...\n"
+            f"✅ Clip {index} ready"
         )
         await upload_to_channel(output, f"Part {index:02d} • {duration}s")
 
@@ -314,10 +333,31 @@ async def start_bot():
         )
 
         try:
-            source, _ = await asyncio.to_thread(download_url, job["url"])
-            await create_clips(
-                chat_id, source, job["duration"], clip_count, event
-            )
+            last_download_update = [0.0]
+
+            def download_progress(downloaded, total, speed):
+                now = time.time()
+                if now - last_download_update[0] < 1.0 and not (total and downloaded >= total):
+                    return
+                last_download_update[0] = now
+                loop = asyncio.get_running_loop()
+                if total:
+                    text = (
+                        f"⬇️ Downloading source\n"
+                        f"📊 {downloaded / total * 100:.0f}% • "
+                        f"{downloaded / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB\n"
+                        f"⚡ {speed / 1024 / 1024:.2f} MB/s"
+                    )
+                else:
+                    text = (
+                        f"⬇️ Downloading source\n"
+                        f"📦 {downloaded / 1024 / 1024:.1f} MB\n"
+                        f"⚡ {speed / 1024 / 1024:.2f} MB/s"
+                    )
+                asyncio.run_coroutine_threadsafe(event.edit(text), loop)
+
+            source, _ = await asyncio.to_thread(download_url, job["url"], download_progress)
+            await create_clips(chat_id, source, job["duration"], clip_count, event)
         except Exception as e:
             await event.edit(f"❌ {type(e).__name__}: {e}")
         finally:
