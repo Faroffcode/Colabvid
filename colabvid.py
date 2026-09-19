@@ -117,8 +117,12 @@ def download(url, progress=None):
     return dest, media
 
 def scenes(path, threshold=27):
-    from scenedetect import open_video, SceneManager
-    from scenedetect.detectors import ContentDetector
+    try:
+        from scenedetect import open_video, SceneManager
+        from scenedetect.detectors import ContentDetector
+    except ImportError:
+        # Fallback: no PySceneDetect installed; use fixed-duration segments.
+        return [(x, min(x + 60, duration)) for x in range(0, int(duration), 60)]
     v = open_video(str(path)); sm = SceneManager()
     sm.add_detector(ContentDetector(threshold=threshold, min_scene_len=12))
     sm.detect_scenes(video=v)
