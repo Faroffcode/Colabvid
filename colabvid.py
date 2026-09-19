@@ -18,6 +18,9 @@ CHANNEL_ID = os.environ.get("COLABVID_CHANNEL_ID", "")
 BOT = None
 USER_JOBS = {}
 
+def log(message):
+    print(f"[Colabvid {time.strftime('%H:%M:%S')}] {message}", flush=True)
+
 def run(args, capture=False):
     return subprocess.run([str(x) for x in args], check=True, text=True, capture_output=capture)
 
@@ -74,9 +77,11 @@ def download_url(url, progress_callback=None):
     name = Path(unquote(urlparse(resolved).path)).name or "source_video"
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:120]
     destination = DOWNLOADS / f"{int(time.time())}_{name}"
+    log(f"Download started: {resolved}")
     with requests.get(resolved, headers={"User-Agent": UA}, stream=True, timeout=(30, 120)) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length") or 0)
+        log(f"Download response: HTTP {r.status_code}, size={'unknown' if not total else f'{total/1024/1024:.1f} MB'}")
         downloaded = 0
         started = time.time()
         last_update = 0.0
@@ -91,6 +96,7 @@ def download_url(url, progress_callback=None):
                     speed = downloaded / max(now - started, 0.001)
                     progress_callback(downloaded, total, speed)
                     last_update = now
+    log(f"Download complete: {destination} ({downloaded/1024/1024:.1f} MB)")
     return destination, probe(destination)
 
 def make_plan(duration, target, clip_count):
@@ -104,9 +110,24 @@ def make_plan(duration, target, clip_count):
     starts = [max_start * i / (clip_count - 1) for i in range(clip_count)]
     return [(start, min(start + target, duration)) for start in starts]
 
+def duration_buttons():
+    values = [15, 30, 45, 60, 90, 120]
+    return [
+        [Button.inline(f"{v}s", f"duration:{v}") for v in values[:3]],
+        [Button.inline(f"{v}s", f"duration:{v}") for v in values[3:]],
+    ]
+
+def clip_buttons():
+    values = [1, 5, 10, 15, 20, 30, 50, 100]
+    return [
+        [Button.inline(str(v), f"clips:{v}") for v in values[:4]],
+        [Button.inline(str(v), f"clips:{v}") for v in values[4:]],
+    ]
+
 async def render_clip(source, start, end, output, progress_callback=None):
     vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
     duration = max(0.1, end - start)
+    log(f"Clipping: {output.name} ({start:.1f}s -> {end:.1f}s)")
     cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(source), "-t", str(duration),
            "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
@@ -132,11 +153,11 @@ async def render_clip(source, start, end, output, progress_callback=None):
                 pass
     if await process.wait() != 0:
         raise RuntimeError(f"FFmpeg failed while creating {output.name}.")
+    log(f"Clip complete: {output}")
 
 async def upload_to_channel(file_path, caption):
     if not CHANNEL_ID:
         raise ValueError("COLABVID_CHANNEL_ID is not configured.")
-
     target = CHANNEL_ID.strip()
     try:
         if target.lstrip("-").isdigit():
@@ -144,22 +165,17 @@ async def upload_to_channel(file_path, caption):
         else:
             target = await BOT.get_entity(target.lstrip("@"))
     except Exception as e:
-        raise ValueError(
-            "CHANNEL_ID must be the numeric Telegram channel ID, usually starting with -100."
-        ) from e
-
-    await BOT.send_file(
-        target,
-        str(file_path),
-        caption=caption[:1024],
-        supports_streaming=True,
-    )
+        raise ValueError("CHANNEL_ID must be the numeric Telegram channel ID, usually starting with -100.") from e
+    log(f"Uploading: {file_path.name}")
+    await BOT.send_file(target, str(file_path), caption=caption[:1024], supports_streaming=True)
+    log(f"Upload complete: {file_path.name}")
 
 async def create_clips(chat_id, source, duration, clip_count, status_message):
     media = probe(source)
     plan = make_plan(media["duration"], duration, clip_count)
     job_dir = OUTPUTS / f"{chat_id}_{time.strftime('%Y%m%d_%H%M%S')}"
     job_dir.mkdir(parents=True, exist_ok=True)
+    log(f"Processing job: {len(plan)} clips x {duration}s from {media['duration']:.1f}s")
 
     await status_message.edit(
         f"📥 Download complete\n🎬 Source: {media['duration'] / 60:.1f} min\n"
@@ -175,45 +191,39 @@ async def create_clips(chat_id, source, duration, clip_count, status_message):
                 f"📊 Progress: {percent:.0f}%\n"
                 f"⏱ {elapsed:.0f}s / {total:.0f}s"
             )
+            log(f"Clipping {index}/{len(plan)}: {percent:.0f}%")
 
-        await status_message.edit(
-            f"🎬 Clipping {index}/{len(plan)}\n⏱ {end - start:.0f}s"
-        )
+        await status_message.edit(f"🎬 Clipping {index}/{len(plan)}\n⏱ {end - start:.0f}s")
         await render_clip(source, start, end, output, render_status)
-
-        await status_message.edit(
-            f"📤 Uploading {index}/{len(plan)}...\n"
-            f"✅ Clip {index} ready"
-        )
+        await status_message.edit(f"📤 Uploading {index}/{len(plan)}...\n✅ Clip {index} ready")
         await upload_to_channel(output, f"Part {index:02d} • {duration}s")
 
-    await status_message.edit(
-        f"✅ Finished!\nUploaded {len(plan)} clips to the Telegram channel."
-    )
+    log(f"Job complete: uploaded {len(plan)} clips")
+    await status_message.edit(f"✅ Finished!\nUploaded {len(plan)} clips to the Telegram channel.")
 
 async def start_bot():
     global BOT
     if not API_ID or not API_HASH or not BOT_TOKEN or not CHANNEL_ID:
-        raise RuntimeError(
-            "Set COLABVID_API_ID, COLABVID_API_HASH, COLABVID_BOT_TOKEN "
-            "and COLABVID_CHANNEL_ID first."
-        )
+        raise RuntimeError("Set COLABVID_API_ID, COLABVID_API_HASH, COLABVID_BOT_TOKEN and COLABVID_CHANNEL_ID first.")
 
+    log("Starting Colabvid Telegram bot...")
+    log(f"Channel ID: {CHANNEL_ID}")
     BOT = TelegramClient(str(ROOT / "bot_session"), API_ID, API_HASH)
     await BOT.start(bot_token=BOT_TOKEN)
+    log("Telegram bot connected successfully.")
+    log("Waiting for /start or a video URL...")
 
     @BOT.on(events.NewMessage(incoming=True))
     async def on_message(event):
         if not event.is_private:
             return
         text = (event.raw_text or "").strip()
+        log(f"Message received from chat {event.chat_id}: {text[:120]}")
 
         if text in ("/start", "/help"):
             await event.respond(
-                "🎬 Colabvid Bot\n\n"
-                "Send me a public video URL.\n"
-                "Then choose reel duration and number of clips.\n\n"
-                "Example: https://example.com/video"
+                "🎬 Colabvid Bot\n\nSend me a public video URL.\n"
+                "Then choose reel duration and number of clips."
             )
             return
 
@@ -225,21 +235,15 @@ async def start_bot():
         try:
             info = inspect_url(text)
             resolved = resolve_public_page(info)
+            log(f"URL inspected: kind={info['kind']} type={info.get('content_type','unknown')}")
             if not resolved:
                 if info["kind"] == "page":
                     raise ValueError("I couldn't find a normal public direct video URL on that page.")
                 resolved = text
-
-            USER_JOBS[event.chat_id] = {
-                "url": text,
-                "resolved": resolved,
-                "info": info,
-            }
-            await status.edit(
-                "✅ URL inspected.\n\nSelect your Instagram Reel duration:",
-                buttons=duration_buttons(),
-            )
+            USER_JOBS[event.chat_id] = {"url": text, "resolved": resolved, "info": info}
+            await status.edit("✅ URL inspected.\n\nSelect your Instagram Reel duration:", buttons=duration_buttons())
         except Exception as e:
+            log(f"URL inspection error: {type(e).__name__}: {e}")
             await status.edit(f"❌ {type(e).__name__}: {e}")
 
     @BOT.on(events.CallbackQuery(pattern=rb"duration:(\d+)"))
@@ -251,10 +255,8 @@ async def start_bot():
             return
         duration = int(event.pattern_match.group(1))
         job["duration"] = duration
-        await event.edit(
-            f"✅ Reel duration: {duration}s\n\nNow select the number of clips:",
-            buttons=clip_buttons(),
-        )
+        log(f"Chat {chat_id} selected duration: {duration}s")
+        await event.edit(f"✅ Reel duration: {duration}s\n\nNow select the number of clips:", buttons=clip_buttons())
 
     @BOT.on(events.CallbackQuery(pattern=rb"clips:(\d+)"))
     async def on_clips(event):
@@ -263,14 +265,13 @@ async def start_bot():
         if not job or "duration" not in job:
             await event.answer("Send a video URL first.", alert=True)
             return
-
         clip_count = int(event.pattern_match.group(1))
         job["clip_count"] = clip_count
+        log(f"Chat {chat_id} selected {clip_count} clips at {job['duration']}s")
         await event.edit(
             f"🚀 Starting...\n\n🎞 Reel duration: {job['duration']}s\n"
             f"🔢 Clips: {clip_count}\n\nDownloading and processing now..."
         )
-
         try:
             loop = asyncio.get_running_loop()
             last_download_update = [0.0]
@@ -282,26 +283,22 @@ async def start_bot():
                 last_download_update[0] = now
                 if total:
                     text = (
-                        f"⬇️ Downloading source\n"
-                        f"📊 {downloaded / total * 100:.0f}% • "
+                        f"⬇️ Downloading source\n📊 {downloaded / total * 100:.0f}% • "
                         f"{downloaded / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB\n"
                         f"⚡ {speed / 1024 / 1024:.2f} MB/s"
                     )
                 else:
-                    text = (
-                        f"⬇️ Downloading source\n"
-                        f"📦 {downloaded / 1024 / 1024:.1f} MB\n"
-                        f"⚡ {speed / 1024 / 1024:.2f} MB/s"
-                    )
+                    text = f"⬇️ Downloading source\n📦 {downloaded / 1024 / 1024:.1f} MB\n⚡ {speed / 1024 / 1024:.2f} MB/s"
                 asyncio.run_coroutine_threadsafe(event.edit(text), loop)
 
             source, _ = await asyncio.to_thread(download_url, job["url"], download_progress)
             await create_clips(chat_id, source, job["duration"], clip_count, event)
         except Exception as e:
+            log(f"Job error: {type(e).__name__}: {e}")
             await event.edit(f"❌ {type(e).__name__}: {e}")
         finally:
             USER_JOBS.pop(chat_id, None)
 
-    print("🤖 Colabvid Telegram bot is running...")
-    print("Send /start to your bot.")
+    print("🤖 Colabvid Telegram bot is running...", flush=True)
+    print("📟 Terminal logs are enabled below.", flush=True)
     await BOT.run_until_disconnected()
