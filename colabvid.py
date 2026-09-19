@@ -62,21 +62,33 @@ def probe(path):
     if duration <= 0: raise ValueError("Could not determine video duration.")
     return {"duration":duration,"width":video.get("width"),"height":video.get("height"),"codec":video.get("codec_name")}
 
-def download_url(url):
+def download_url(url, progress_callback=None):
     info = inspect_url(url)
     resolved = resolve_public_page(info)
     if not resolved:
         if info["kind"] == "page":
-            raise ValueError("The page did not expose a normal public direct video URL. Login, CAPTCHA, anti-bot and DRM bypass are not supported.")
+            raise ValueError("The page did not expose a normal public direct video URL.")
         resolved = url
     name = Path(unquote(urlparse(resolved).path)).name or "source_video"
-    name = re.sub(r"[^A-Za-z0-9_.-]+","_",name)[:120]
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:120]
     destination = DOWNLOADS / f"{int(time.time())}_{name}"
-    with requests.get(resolved, headers={"User-Agent":UA}, stream=True, timeout=(30,120)) as r:
+    with requests.get(resolved, headers={"User-Agent": UA}, stream=True, timeout=(30, 120)) as r:
         r.raise_for_status()
-        with open(destination,"wb") as f:
-            for chunk in r.iter_content(1024*1024):
-                if chunk: f.write(chunk)
+        total = int(r.headers.get("content-length") or 0)
+        downloaded = 0
+        started = time.time()
+        last_update = 0.0
+        with open(destination, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                now = time.time()
+                if progress_callback and (now - last_update >= 4.0 or (total and downloaded >= total)):
+                    speed = downloaded / max(now - started, 0.001)
+                    progress_callback(downloaded, total, speed)
+                    last_update = now
     return destination, probe(destination)
 
 def make_plan(duration, target, clip_count):
@@ -105,8 +117,9 @@ async def render_clip(source, start, end, output, progress_callback=None):
            "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
            "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(output)]
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
-                                                    stderr=asyncio.subprocess.DEVNULL)
+    process = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+    )
     last_update = 0.0
     while True:
         line = await process.stdout.readline()
@@ -118,7 +131,7 @@ async def render_clip(source, start, end, output, progress_callback=None):
                 elapsed = int(text.split("=", 1)[1]) / 1_000_000
                 percent = min(100, elapsed / duration * 100)
                 now = time.time()
-                if progress_callback and (now - last_update >= 0.8 or percent >= 100):
+                if progress_callback and (now - last_update >= 4.0 or percent >= 100):
                     await progress_callback(percent, elapsed, duration)
                     last_update = now
             except ValueError:
@@ -164,17 +177,6 @@ def make_plan(duration, target, clip_count):
     max_start = duration - target
     starts = [max_start * i / (clip_count - 1) for i in range(clip_count)]
     return [(start, min(start + target, duration)) for start in starts]
-
-
-def render_clip(source, start, end, output):
-    vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-    run([
-        "ffmpeg", "-y", "-ss", str(start), "-i", str(source),
-        "-t", str(end - start), "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart", str(output),
-    ])
 
 
 def duration_buttons():
