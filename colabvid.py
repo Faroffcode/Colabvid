@@ -18,6 +18,7 @@ BOT_TOKEN = os.environ.get("COLABVID_BOT_TOKEN", "")
 CHANNEL_ID = os.environ.get("COLABVID_CHANNEL_ID", "")
 BOT = None
 USER_JOBS = {}
+VIDEO_ENCODER = None
 
 def log(message):
     print(f"[Colabvid {time.strftime('%H:%M:%S')}] {message}", flush=True)
@@ -26,21 +27,33 @@ def run(args, capture=False):
     return subprocess.run([str(x) for x in args], check=True, text=True, capture_output=capture)
 
 def detect_video_encoder():
-    """Use NVIDIA NVENC when available; otherwise fall back to CPU libx264."""
-    try:
-        result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], check=True, text=True, capture_output=True)
-        if "h264_nvenc" in result.stdout:
-            try:
-                subprocess.run(["nvidia-smi", "-L"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                log("NVIDIA GPU detected; using h264_nvenc.")
-                return "nvenc"
-            except Exception:
-                pass
-    except Exception:
-        pass
-    log("NVIDIA NVENC unavailable; using CPU libx264.")
-    return "cpu"
+    """Detect a usable H.264 encoder once and cache the result."""
+    global VIDEO_ENCODER
+    if VIDEO_ENCODER in ("nvenc", "cpu"):
+        return VIDEO_ENCODER
 
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            check=True, text=True, capture_output=True
+        )
+        nvenc_available = "h264_nvenc" in result.stdout
+        if nvenc_available:
+            subprocess.run(
+                ["nvidia-smi", "-L"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            VIDEO_ENCODER = "nvenc"
+            log("NVIDIA GPU detected; using h264_nvenc for this Colab session.")
+            return VIDEO_ENCODER
+    except Exception as e:
+        log(f"NVENC detection unavailable: {e}")
+
+    VIDEO_ENCODER = "cpu"
+    log("NVIDIA NVENC unavailable; using CPU libx264 for this Colab session.")
+    return VIDEO_ENCODER
 
 def inspect_url(url):
     url = url.strip()
@@ -52,38 +65,67 @@ def inspect_url(url):
         m = re.search(r"/(?:u|l)/([A-Za-z0-9_-]+)", p.path)
         if m:
             fid = m.group(1)
-            r = requests.get(f"https://pixeldrain.com/api/file/{fid}/info", headers={"User-Agent": UA}, timeout=30)
+            r = requests.get(
+                f"https://pixeldrain.com/api/file/{fid}/info",
+                headers={"User-Agent": UA}, timeout=30
+            )
             r.raise_for_status()
             info = r.json()
-            return {"kind":"pixeldrain","final_url":f"https://pixeldrain.com/api/file/{fid}","content_type":info.get("mime_type",""),"name":info.get("name",""),"size":info.get("size")}
+            return {
+                "kind": "pixeldrain",
+                "final_url": f"https://pixeldrain.com/api/file/{fid}",
+                "content_type": info.get("mime_type", ""),
+                "name": info.get("name", ""),
+                "size": info.get("size")
+            }
+
     r = requests.head(url, headers={"User-Agent": UA}, allow_redirects=True, timeout=30)
     ct = (r.headers.get("content-type") or "").split(";")[0].lower()
-    kind = "media" if ct.startswith("video/") or ct == "application/octet-stream" else ("page" if "text/html" in ct else "unknown")
-    return {"kind":kind,"source_url":url,"final_url":r.url,"status":r.status_code,"content_type":ct}
+    kind = (
+        "media" if ct.startswith("video/") or ct == "application/octet-stream"
+        else ("page" if "text/html" in ct else "unknown")
+    )
+    return {
+        "kind": kind,
+        "source_url": url,
+        "final_url": r.url,
+        "status": r.status_code,
+        "content_type": ct
+    }
 
 def resolve_public_page(info):
-    if info["kind"] == "pixeldrain": return info["final_url"]
-    if info["kind"] == "media": return info["final_url"]
-    if info["kind"] != "page": return None
+    if info["kind"] in ("pixeldrain", "media"):
+        return info["final_url"]
+    if info["kind"] != "page":
+        return None
+
     r = requests.get(info["final_url"], headers={"User-Agent": UA}, timeout=30)
     r.raise_for_status()
     candidates = re.findall(r'https?://[^"\'<>\s]+', r.text, re.I)
     for value in candidates:
         value = html.unescape(value)
-        if value.split("?")[0].lower().endswith((".mp4",".webm",".mkv",".mov",".m4v")):
+        if value.split("?")[0].lower().endswith((".mp4", ".webm", ".mkv", ".mov", ".m4v")):
             return value
     return None
 
 def probe(path):
-    result = run(["ffprobe","-v","error","-show_format","-show_streams","-of","json",str(path)], capture=True)
+    result = run(
+        ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)],
+        capture=True
+    )
     data = json.loads(result.stdout)
-    video = next((s for s in data.get("streams",[]) if s.get("codec_type")=="video"), None)
+    video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
     if not video:
         raise ValueError("The file does not contain a video stream.")
-    duration = float(data.get("format",{}).get("duration") or video.get("duration") or 0)
+    duration = float(data.get("format", {}).get("duration") or video.get("duration") or 0)
     if duration <= 0:
         raise ValueError("Could not determine video duration.")
-    return {"duration":duration,"width":int(video.get("width") or 1080),"height":int(video.get("height") or 1920),"codec":video.get("codec_name")}
+    return {
+        "duration": duration,
+        "width": int(video.get("width") or 1080),
+        "height": int(video.get("height") or 1920),
+        "codec": video.get("codec_name")
+    }
 
 def download_url(url, progress_callback=None):
     info = inspect_url(url)
@@ -92,17 +134,23 @@ def download_url(url, progress_callback=None):
         if info["kind"] == "page":
             raise ValueError("The page did not expose a normal public direct video URL.")
         resolved = url
+
     name = Path(unquote(urlparse(resolved).path)).name or "source_video"
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)[:120]
     destination = DOWNLOADS / f"{int(time.time())}_{name}"
+
     log(f"Download started: {resolved}")
     with requests.get(resolved, headers={"User-Agent": UA}, stream=True, timeout=(30, 120)) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length") or 0)
-        log(f"Download response: HTTP {r.status_code}, size={'unknown' if not total else f'{total/1024/1024:.1f} MB'}")
+        log(
+            f"Download response: HTTP {r.status_code}, "
+            f"size={'unknown' if not total else f'{total/1024/1024:.1f} MB'}"
+        )
         downloaded = 0
         started = time.time()
         last_update = 0.0
+
         with open(destination, "wb") as f:
             for chunk in r.iter_content(1024 * 1024):
                 if not chunk:
@@ -110,10 +158,13 @@ def download_url(url, progress_callback=None):
                 f.write(chunk)
                 downloaded += len(chunk)
                 now = time.time()
-                if progress_callback and (now - last_update >= 4.0 or (total and downloaded >= total)):
+                if progress_callback and (
+                    now - last_update >= 4.0 or (total and downloaded >= total)
+                ):
                     speed = downloaded / max(now - started, 0.001)
                     progress_callback(downloaded, total, speed)
                     last_update = now
+
     log(f"Download complete: {destination} ({downloaded/1024/1024:.1f} MB)")
     return destination, probe(destination)
 
@@ -154,16 +205,43 @@ async def render_clip(source, start, end, output, progress_callback=None):
     vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"
     duration = max(0.1, end - start)
     log(f"Clipping: {output.name} ({start:.1f}s -> {end:.1f}s)")
+
     encoder = detect_video_encoder()
     if encoder == "nvenc":
-        video_args = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+        video_args = [
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-rc", "vbr", "-cq", "23", "-b:v", "0"
+        ]
     else:
         video_args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
-    cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(source), "-t", str(duration),
-           "-vf", vf, *video_args, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-           "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(output)]
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+
+    cmd = [
+        "ffmpeg", "-y", "-ss", str(start), "-i", str(source), "-t", str(duration),
+        "-vf", vf, *video_args, "-pix_fmt", "yuv420p",
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", "-progress", "pipe:1", "-nostats",
+        str(output)
+    ]
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
     last_update = 0.0
+    stderr_chunks = []
+
+    async def read_stderr():
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                break
+            stderr_chunks.append(line.decode("utf-8", "ignore"))
+
+    stderr_task = asyncio.create_task(read_stderr())
+
     while True:
         line = await process.stdout.readline()
         if not line:
@@ -179,12 +257,22 @@ async def render_clip(source, start, end, output, progress_callback=None):
                     last_update = now
             except ValueError:
                 pass
-    if await process.wait() != 0:
-        raise RuntimeError(f"FFmpeg failed while creating {output.name}.")
+
+    await stderr_task
+    return_code = await process.wait()
+
+    if return_code != 0:
+        error_text = "".join(stderr_chunks).strip()
+        if len(error_text) > 1800:
+            error_text = error_text[-1800:]
+        raise RuntimeError(
+            f"FFmpeg failed while creating {output.name}.\n"
+            f"{error_text or 'No FFmpeg error output was available.'}"
+        )
+
     log(f"Clip complete: {output}")
 
 def create_thumbnail(video_path, thumb_path):
-    # Telegram works best with a JPEG thumbnail; generate it from ~1 second in.
     run([
         "ffmpeg", "-y", "-ss", "1", "-i", str(video_path),
         "-frames:v", "1", "-vf", "scale=320:-1",
@@ -203,7 +291,9 @@ async def upload_to_channel(file_path, caption):
         else:
             target = await BOT.get_entity(target.lstrip("@"))
     except Exception as e:
-        raise ValueError("CHANNEL_ID must be the numeric Telegram channel ID, usually starting with -100.") from e
+        raise ValueError(
+            "CHANNEL_ID must be the numeric Telegram channel ID, usually starting with -100."
+        ) from e
 
     media = probe(file_path)
     duration = max(1, int(round(media["duration"])))
@@ -213,7 +303,10 @@ async def upload_to_channel(file_path, caption):
     thumb = file_path.with_suffix(".jpg")
     create_thumbnail(file_path, thumb)
 
-    log(f"Uploading: {file_path.name} | duration={duration}s | {width}x{height} | thumbnail={thumb.name}")
+    log(
+        f"Uploading: {file_path.name} | duration={duration}s | "
+        f"{width}x{height} | thumbnail={thumb.name}"
+    )
 
     attributes = [
         DocumentAttributeVideo(
@@ -249,30 +342,50 @@ async def create_clips(chat_id, source, duration, clip_count, status_message, ba
     job_dir.mkdir(parents=True, exist_ok=True)
     log(f"Processing job: {len(plan)} clips x {duration}s from {media['duration']:.1f}s")
 
-    await status_message.edit(f"📥 Download complete\n🎬 Source: {media['duration'] / 60:.1f} min\n✂️ Preparing {len(plan)} clips × {duration}s...")
+    await status_message.edit(
+        f"📥 Download complete\n"
+        f"🎬 Source: {media['duration'] / 60:.1f} min\n"
+        f"✂️ Preparing {len(plan)} clips × {duration}s..."
+    )
 
     for index, (start, end) in enumerate(plan, 1):
         output = job_dir / f"{base_name} {index:02d}.mp4"
 
         async def render_status(percent, elapsed, total):
-            await status_message.edit(f"🎬 Clipping {index}/{len(plan)}\n📊 Progress: {percent:.0f}%\n⏱ {elapsed:.0f}s / {total:.0f}s")
+            await status_message.edit(
+                f"🎬 Clipping {index}/{len(plan)}\n"
+                f"📊 Progress: {percent:.0f}%\n"
+                f"⏱ {elapsed:.0f}s / {total:.0f}s"
+            )
             log(f"Clipping {index}/{len(plan)}: {percent:.0f}%")
 
-        await status_message.edit(f"🎬 Clipping {index}/{len(plan)}\n⏱ {end - start:.0f}s")
+        await status_message.edit(
+            f"🎬 Clipping {index}/{len(plan)}\n"
+            f"⏱ {end - start:.0f}s"
+        )
         await render_clip(source, start, end, output, render_status)
-        await status_message.edit(f"📤 Uploading {index}/{len(plan)}...\n✅ Clip {index} ready")
+        await status_message.edit(
+            f"📤 Uploading {index}/{len(plan)}...\n"
+            f"✅ Clip {index} ready"
+        )
         await upload_to_channel(output, f"Part {index:02d} • {duration}s")
 
     log(f"Job complete: uploaded {len(plan)} clips")
-    await status_message.edit(f"✅ Finished!\nUploaded {len(plan)} clips to the Telegram channel.")
+    await status_message.edit(
+        f"✅ Finished!\nUploaded {len(plan)} clips to the Telegram channel."
+    )
 
 async def start_bot():
     global BOT
     if not API_ID or not API_HASH or not BOT_TOKEN or not CHANNEL_ID:
-        raise RuntimeError("Set COLABVID_API_ID, COLABVID_API_HASH, COLABVID_BOT_TOKEN and COLABVID_CHANNEL_ID first.")
+        raise RuntimeError(
+            "Set COLABVID_API_ID, COLABVID_API_HASH, "
+            "COLABVID_BOT_TOKEN and COLABVID_CHANNEL_ID first."
+        )
 
     log("Starting Colabvid Telegram bot...")
     log(f"Channel ID: {CHANNEL_ID}")
+    log(f"Video encoder: {detect_video_encoder()}")
     BOT = TelegramClient(str(ROOT / "bot_session"), API_ID, API_HASH)
     await BOT.start(bot_token=BOT_TOKEN)
     log("Telegram bot connected successfully.")
@@ -286,7 +399,11 @@ async def start_bot():
         log(f"Message received from chat {event.chat_id}: {text[:120]}")
 
         if text in ("/start", "/help"):
-            await event.respond("🎬 Colabvid Bot\n\nSend me a public video URL.\nThen choose reel duration and number of clips.")
+            await event.respond(
+                "🎬 Colabvid Bot\n\n"
+                "Send me a public video URL.\n"
+                "Then choose reel duration and number of clips."
+            )
             return
 
         if event.chat_id in USER_JOBS and USER_JOBS[event.chat_id].get("awaiting_name"):
@@ -294,9 +411,16 @@ async def start_bot():
                 name = sanitize_filename(text)
                 USER_JOBS[event.chat_id]["name"] = name
                 USER_JOBS[event.chat_id]["awaiting_name"] = False
-                await event.respond(f"✅ File name: {name}.mp4\n\nSelect your Instagram Reel duration:", buttons=duration_buttons())
+                await event.respond(
+                    f"✅ File name: {name}.mp4\n\n"
+                    "Select your Instagram Reel duration:",
+                    buttons=duration_buttons()
+                )
             except Exception as e:
-                await event.respond(f"❌ {e}\n\nSend the file name again (without extension).")
+                await event.respond(
+                    f"❌ {e}\n\n"
+                    "Send the file name again (without extension)."
+                )
             return
 
         if not re.match(r"^https?://", text, re.I):
@@ -307,13 +431,26 @@ async def start_bot():
         try:
             info = inspect_url(text)
             resolved = resolve_public_page(info)
-            log(f"URL inspected: kind={info['kind']} type={info.get('content_type','unknown')}")
+            log(
+                f"URL inspected: kind={info['kind']} "
+                f"type={info.get('content_type', 'unknown')}"
+            )
             if not resolved:
                 if info["kind"] == "page":
-                    raise ValueError("I couldn't find a normal public direct video URL on that page.")
+                    raise ValueError(
+                        "I couldn't find a normal public direct video URL on that page."
+                    )
                 resolved = text
-            USER_JOBS[event.chat_id] = {"url": text, "resolved": resolved, "info": info, "awaiting_name": True}
-            await status.edit("✅ URL inspected.\n\n📝 Send the file name you want to use (without extension).")
+            USER_JOBS[event.chat_id] = {
+                "url": text,
+                "resolved": resolved,
+                "info": info,
+                "awaiting_name": True
+            }
+            await status.edit(
+                "✅ URL inspected.\n\n"
+                "📝 Send the file name you want to use (without extension)."
+            )
         except Exception as e:
             log(f"URL inspection error: {type(e).__name__}: {e}")
             await status.edit(f"❌ {type(e).__name__}: {e}")
@@ -328,7 +465,11 @@ async def start_bot():
         duration = int(event.pattern_match.group(1))
         job["duration"] = duration
         log(f"Chat {chat_id} selected duration: {duration}s")
-        await event.edit(f"✅ Reel duration: {duration}s\n\nNow select the number of clips:", buttons=clip_buttons())
+        await event.edit(
+            f"✅ Reel duration: {duration}s\n\n"
+            "Now select the number of clips:",
+            buttons=clip_buttons()
+        )
 
     @BOT.on(events.CallbackQuery(pattern=rb"clips:(\d+)"))
     async def on_clips(event):
@@ -337,30 +478,59 @@ async def start_bot():
         if not job or "duration" not in job:
             await event.answer("Send a video URL first.", alert=True)
             return
+
         clip_count = int(event.pattern_match.group(1))
         job["clip_count"] = clip_count
         log(f"Chat {chat_id} selected {clip_count} clips at {job['duration']}s")
+
         if not job.get("name"):
             await event.answer("Send the file name first.", alert=True)
             return
-        await event.edit(f"🚀 Starting...\n\n📝 File: {job['name']}.mp4\n🎞 Reel duration: {job['duration']}s\n🔢 Clips: {clip_count}\n\nDownloading and processing now...")
+
+        await event.edit(
+            f"🚀 Starting...\n\n"
+            f"📝 File: {job['name']}.mp4\n"
+            f"🎞 Reel duration: {job['duration']}s\n"
+            f"🔢 Clips: {clip_count}\n\n"
+            "Downloading and processing now..."
+        )
+
         try:
             loop = asyncio.get_running_loop()
             last_download_update = [0.0]
 
             def download_progress(downloaded, total, speed):
                 now = time.time()
-                if now - last_download_update[0] < 4.0 and not (total and downloaded >= total):
+                if (
+                    now - last_download_update[0] < 4.0
+                    and not (total and downloaded >= total)
+                ):
                     return
                 last_download_update[0] = now
+
                 if total:
-                    text = f"⬇️ Downloading source\n📊 {downloaded / total * 100:.0f}% • {downloaded / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB\n⚡ {speed / 1024 / 1024:.2f} MB/s"
+                    text = (
+                        "⬇️ Downloading source\n"
+                        f"📊 {downloaded / total * 100:.0f}% • "
+                        f"{downloaded / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB\n"
+                        f"⚡ {speed / 1024 / 1024:.2f} MB/s"
+                    )
                 else:
-                    text = f"⬇️ Downloading source\n📦 {downloaded / 1024 / 1024:.1f} MB\n⚡ {speed / 1024 / 1024:.2f} MB/s"
+                    text = (
+                        "⬇️ Downloading source\n"
+                        f"📦 {downloaded / 1024 / 1024:.1f} MB\n"
+                        f"⚡ {speed / 1024 / 1024:.2f} MB/s"
+                    )
+
                 asyncio.run_coroutine_threadsafe(event.edit(text), loop)
 
-            source, _ = await asyncio.to_thread(download_url, job["url"], download_progress)
-            await create_clips(chat_id, source, job["duration"], clip_count, event, job["name"])
+            source, _ = await asyncio.to_thread(
+                download_url, job["url"], download_progress
+            )
+            await create_clips(
+                chat_id, source, job["duration"], clip_count,
+                event, job["name"]
+            )
         except Exception as e:
             log(f"Job error: {type(e).__name__}: {e}")
             await event.edit(f"❌ {type(e).__name__}: {e}")
