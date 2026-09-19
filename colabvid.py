@@ -398,105 +398,179 @@ async def create_clips(
     save_job_manifest(manifest_path, manifest)
 
     completed = set(manifest.get("completed", []))
+    queue_size = max(1, min(int(os.environ.get("COLABVID_QUEUE_SIZE", "2")), 5))
+    clip_queue = asyncio.Queue(maxsize=queue_size)
+    status_lock = asyncio.Lock()
+
+    async def safe_edit(text):
+        async with status_lock:
+            try:
+                await status_message.edit(text)
+            except Exception as e:
+                log(f"Status update warning: {e}")
+
     log(
         f"Processing job: {len(plan)} clips x {duration}s from "
         f"{media['duration']:.1f}s ({len(completed)}/{len(plan)} already complete)"
     )
+    log(
+        f"Pipeline enabled: encoder and uploader run together; "
+        f"upload queue capacity={queue_size}"
+    )
 
-    await status_message.edit(
+    await safe_edit(
         f"📥 Download complete\n"
         f"🎬 Source: {media['duration'] / 60:.1f} min\n"
         f"✂️ {len(plan)} clips × {duration}s\n"
+        f"⚡ Pipeline: Encoding + Uploading together\n"
+        f"📦 Upload queue: {queue_size} clip(s)\n"
         f"✅ Resuming: {len(completed)}/{len(plan)} complete"
     )
 
-    for index, (start, end) in enumerate(plan, 1):
-        output = job_dir / f"{base_name} {index:02d}.mp4"
+    async def encoder_worker():
+        for index, (start, end) in enumerate(plan, 1):
+            output = job_dir / f"{base_name} {index:02d}.mp4"
 
-        if index in completed:
-            log(f"Resume: skipping completed clip {index}/{len(plan)}")
-            continue
+            if index in completed:
+                log(f"Resume: skipping completed clip {index}/{len(plan)}")
+                continue
 
-        async def render_status(percent, elapsed, total):
-            await status_message.edit(
-                f"🎬 Clip {index}/{len(plan)}\n"
-                f"📊 Encoding: {percent:.0f}%\n"
-                f"⏱ {elapsed:.0f}s / {total:.0f}s\n"
-                f"✅ Uploaded: {len(completed)}/{len(plan)}"
+            async def render_status(percent, elapsed, total, index=index, start=start, end=end):
+                queued = clip_queue.qsize()
+                await safe_edit(
+                    f"🎬 Encoding clip {index}/{len(plan)}\n"
+                    f"📍 {start:.0f}s → {end:.0f}s\n"
+                    f"📊 Encoding: {percent:.0f}%\n"
+                    f"📦 Upload queue: {queued}/{queue_size}\n"
+                    f"📤 Uploaded: {len(completed)}/{len(plan)}"
+                )
+                log(f"Clipping {index}/{len(plan)}: {percent:.0f}%")
+
+            if output.exists() and output.stat().st_size > 0:
+                log(f"Resume: reusing existing output {output.name}")
+            else:
+                await retry_async(
+                    lambda: render_clip(source, start, end, output, render_status),
+                    attempts=3,
+                    label=f"Render clip {index}"
+                )
+
+            await clip_queue.put((index, start, end, output))
+            log(
+                f"Queued clip {index}/{len(plan)} for upload "
+                f"(queue={clip_queue.qsize()}/{queue_size})"
             )
-            log(f"Clipping {index}/{len(plan)}: {percent:.0f}%")
-
-        await status_message.edit(
-            f"🎬 Clip {index}/{len(plan)}\n"
-            f"📍 {start:.0f}s → {end:.0f}s\n"
-            f"📊 Encoding: 0%\n"
-            f"✅ Uploaded: {len(completed)}/{len(plan)}"
-        )
-
-        if output.exists() and output.stat().st_size > 0:
-            log(f"Resume: reusing existing output {output.name}")
-        else:
-            await retry_async(
-                lambda: render_clip(source, start, end, output, render_status),
-                attempts=3,
-                label=f"Render clip {index}"
+            await safe_edit(
+                f"📦 Clip {index}/{len(plan)} ready\n"
+                f"⏳ Waiting/uploading from queue\n"
+                f"📊 Queue: {clip_queue.qsize()}/{queue_size}\n"
+                f"📤 Uploaded: {len(completed)}/{len(plan)}"
             )
 
-        await status_message.edit(
-            f"📤 Uploading clip {index}/{len(plan)}\n"
-            f"📦 {output.name}\n"
-            f"📊 Uploading: 0%\n"
-            f"⚡ Speed: 0.00 MB/s\n"
-            f"🔁 Retry protection: 3 attempts"
-        )
+        await clip_queue.put(None)
 
-        upload_state = {"started": time.time(), "last_update": 0.0}
+    async def uploader_worker():
+        while True:
+            item = await clip_queue.get()
+            if item is None:
+                clip_queue.task_done()
+                break
 
-        def upload_progress(sent, total):
-            now = time.time()
-            if now - upload_state["last_update"] < 2.0 and sent < total:
-                return
-            upload_state["last_update"] = now
-            elapsed = max(now - upload_state["started"], 0.001)
-            speed = sent / elapsed
-            percent = sent / total * 100 if total else 0
-            text = (
-                f"📤 Uploading clip {index}/{len(plan)}\n"
-                f"📦 {output.name}\n"
-                f"📊 {percent:.0f}% • {sent / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB\n"
-                f"⚡ Speed: {speed / 1024 / 1024:.2f} MB/s"
-            )
-            asyncio.create_task(status_message.edit(text))
+            index, start, end, output = item
+            try:
+                await safe_edit(
+                    f"📤 Uploading clip {index}/{len(plan)}\n"
+                    f"📦 {output.name}\n"
+                    f"📊 Uploading: 0%\n"
+                    f"⚡ Speed: 0.00 MB/s\n"
+                    f"📦 Queue: {clip_queue.qsize()}/{queue_size}\n"
+                    f"🔁 Retry protection: 3 attempts"
+                )
 
-        await retry_async(
-            lambda: upload_to_channel(
-                output,
-                f"🎬 {base_name}\nPart {index:02d}/{len(plan)} • {duration}s",
-                upload_progress
-            ),
-            attempts=3,
-            label=f"Upload clip {index}"
-        )
+                upload_state = {
+                    "started": time.time(),
+                    "last_update": 0.0,
+                    "last_sent": 0,
+                    "last_time": time.time(),
+                }
 
-        completed.add(index)
-        manifest["completed"] = sorted(completed)
-        save_job_manifest(manifest_path, manifest)
+                def upload_progress(sent, total, index=index, output=output):
+                    now = time.time()
+                    if now - upload_state["last_update"] < 2.0 and sent < total:
+                        return
 
-        await status_message.edit(
-            f"✅ Clip {index}/{len(plan)} uploaded\n"
-            f"📈 Overall: {len(completed)}/{len(plan)} complete"
-        )
+                    previous_sent = upload_state["last_sent"]
+                    previous_time = upload_state["last_time"]
+                    interval = max(now - previous_time, 0.001)
+                    current_speed = max(0, sent - previous_sent) / interval
+                    average_speed = sent / max(now - upload_state["started"], 0.001)
+
+                    upload_state["last_sent"] = sent
+                    upload_state["last_time"] = now
+                    upload_state["last_update"] = now
+
+                    percent = sent / total * 100 if total else 0
+                    text = (
+                        f"📤 Uploading clip {index}/{len(plan)}\n"
+                        f"📦 {output.name}\n"
+                        f"📊 {percent:.0f}% • "
+                        f"{sent / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB\n"
+                        f"⚡ Current: {current_speed / 1024 / 1024:.2f} MB/s\n"
+                        f"📈 Average: {average_speed / 1024 / 1024:.2f} MB/s\n"
+                        f"📦 Queue: {clip_queue.qsize()}/{queue_size}"
+                    )
+                    asyncio.create_task(safe_edit(text))
+
+                await retry_async(
+                    lambda: upload_to_channel(
+                        output,
+                        f"🎬 {base_name}\nPart {index:02d}/{len(plan)} • {duration}s",
+                        upload_progress
+                    ),
+                    attempts=3,
+                    label=f"Upload clip {index}"
+                )
+
+                completed.add(index)
+                manifest["completed"] = sorted(completed)
+                save_job_manifest(manifest_path, manifest)
+
+                cleanup_path(output)
+
+                await safe_edit(
+                    f"✅ Clip {index}/{len(plan)} uploaded\n"
+                    f"📈 Overall: {len(completed)}/{len(plan)} complete\n"
+                    f"📦 Queue: {clip_queue.qsize()}/{queue_size}"
+                )
+            finally:
+                clip_queue.task_done()
+
+    encoder_task = asyncio.create_task(encoder_worker())
+    uploader_task = asyncio.create_task(uploader_worker())
+
+    try:
+        await encoder_task
+        await clip_queue.join()
+        await uploader_task
+    except Exception:
+        if not encoder_task.done():
+            encoder_task.cancel()
+        if not uploader_task.done():
+            uploader_task.cancel()
+        await asyncio.gather(encoder_task, uploader_task, return_exceptions=True)
+        raise
 
     log(f"Job complete: uploaded {len(plan)} clips")
-    await status_message.edit(
+    await safe_edit(
         f"✅ Finished!\n"
         f"Uploaded {len(plan)} clips to the Telegram channel.\n"
+        f"⚡ Encoding and uploading were pipelined.\n"
         f"🧹 Cleaning temporary files..."
     )
     cleanup_path(source)
     cleanup_path(job_dir)
     log("Source and temporary output files cleaned up after successful upload.")
-    await status_message.edit(
+    await safe_edit(
         f"✅ Finished!\n"
         f"Uploaded {len(plan)} clips to the Telegram channel.\n"
         f"🧹 Temporary files cleaned up."
