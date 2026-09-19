@@ -394,9 +394,8 @@ def process(
 def ui():
     with gr.Blocks(title="Colabvid") as app:
         gr.Markdown(
-            "# 🎬 Colabvid
-"
-            "### Full movie → Instagram Reels → Telegram"
+            """# 🎬 Colabvid
+### Full movie → Instagram Reels → Telegram"""
         )
 
         with gr.Row():
