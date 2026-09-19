@@ -177,99 +177,17 @@ def download_url(url, progress):
     return destination, media
 
 
-def detect_scenes(path):
-    try:
-        from scenedetect import open_video, SceneManager
-        from scenedetect.detectors import ContentDetector
-
-        video = open_video(str(path))
-        manager = SceneManager()
-        manager.add_detector(ContentDetector(threshold=27, min_scene_len=12))
-        manager.detect_scenes(video=video)
-        scenes = manager.get_scene_list()
-
-        if scenes:
-            return [(a.get_seconds(), b.get_seconds()) for a, b in scenes]
-    except Exception:
-        pass
-
-    duration = probe(path)["duration"]
+def make_plan(duration, target):
+    target = max(1, float(target))
     return [
-        (x, min(x + 60, duration))
-        for x in range(0, int(duration), 60)
+        (x, min(x + target, duration))
+        for x in [i * target for i in range(int(duration // target) + 1)]
+        if x < duration
     ]
 
 
-def make_plan(scenes, duration, target, minimum, maximum):
-    if not scenes:
-        return [(x, min(x + target, duration))
-                for x in range(0, int(duration), target)]
-
-    clips = []
-    start = scenes[0][0]
-    end = start
-
-    for a, b in scenes:
-        if b - start <= maximum:
-            end = b
-            if end - start >= target:
-                clips.append((start, end))
-                start = b
-                end = b
-        else:
-            if end - start >= minimum:
-                clips.append((start, end))
-                start = a
-                end = b
-            else:
-                stop = min(start + maximum, duration)
-                clips.append((start, stop))
-                start = stop
-                end = stop
-
-    if start < duration and end > start:
-        if end - start >= minimum or not clips:
-            clips.append((start, min(end, duration)))
-
-    return clips
-
-
-def create_srt(video, output, model_name):
-    global WHISPER_MODEL
-    import whisper
-
-    if WHISPER_MODEL is None:
-        WHISPER_MODEL = whisper.load_model(model_name)
-
-    result = WHISPER_MODEL.transcribe(str(video), fp16=False)
-
-    def stamp(seconds):
-        ms = int(round((seconds - int(seconds)) * 1000))
-        total = int(seconds)
-        h, rem = divmod(total, 3600)
-        m, s = divmod(rem, 60)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-    with open(output, "w", encoding="utf-8") as f:
-        for i, seg in enumerate(result.get("segments", []), 1):
-            text = (seg.get("text") or "").strip()
-            if text:
-                f.write(
-                    f"{i}\n{stamp(seg['start'])} --> {stamp(seg['end'])}\n"
-                    f"{text}\n\n"
-                )
-
-
-def render_clip(source, start, end, output, srt=None):
+def render_clip(source, start, end, output):
     vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-
-    if srt:
-        subtitle_path = str(Path(srt).resolve()).replace(":", "\\:")
-        vf += (
-            ",subtitles='" + subtitle_path +
-            "':force_style='FontName=DejaVu Sans,FontSize=18,"
-            "Outline=2,Shadow=1,Alignment=2,MarginV=90'"
-        )
 
     run([
         "ffmpeg", "-y",
@@ -285,7 +203,6 @@ def render_clip(source, start, end, output, srt=None):
         "-movflags", "+faststart",
         str(output),
     ])
-
 
 def telegram_upload(api_id, api_hash, bot_token, channel_id, file_path, caption):
     global TELEGRAM_CLIENT
@@ -316,9 +233,7 @@ def telegram_upload(api_id, api_hash, bot_token, channel_id, file_path, caption)
 
 def process(
     source_mode, upload, url,
-    target, minimum, maximum,
-    subtitles, whisper_model,
-    send_telegram,
+    target, send_telegram,
     api_id, api_hash, bot_token, channel_id,
     caption_template,
     progress=gr.Progress(),
@@ -335,23 +250,10 @@ def process(
             source, media = download_url(url, progress)
 
         duration = media["duration"]
-        progress(0.35, "Detecting scenes...")
-        scene_list = detect_scenes(source)
-        plan = make_plan(
-            scene_list, duration,
-            float(target), float(minimum), float(maximum)
-        )
+        plan = make_plan(duration, float(target))
 
         if not plan:
             raise ValueError("No clips could be created.")
-
-        if subtitles:
-            try:
-                import whisper  # noqa: F401
-            except ImportError:
-                raise ValueError(
-                    "Whisper is not installed. Re-run the dependency cell."
-                )
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         job_dir = OUTPUTS / timestamp
@@ -362,23 +264,16 @@ def process(
 
         for index, (start, end) in enumerate(plan, 1):
             output = job_dir / f"Part_{index:02d}.mp4"
-            srt = None
-
-            if subtitles:
-                srt = job_dir / f"Part_{index:02d}.srt"
-                create_srt(source, srt, whisper_model)
 
             progress(
-                0.35 + 0.55 * (index - 1) / total,
+                0.30 + 0.65 * (index - 1) / total,
                 f"Rendering Part {index}/{total}...",
             )
-            render_clip(source, start, end, output, srt)
+            render_clip(source, start, end, output)
             files.append(str(output))
 
             if send_telegram:
-                caption = caption_template.replace(
-                    "{part}", f"{index:02d}"
-                )
+                caption = caption_template.replace("{part}", f"{index:02d}")
                 telegram_upload(
                     api_id, api_hash, bot_token, channel_id,
                     output, caption
@@ -389,94 +284,48 @@ def process(
 
     except Exception as e:
         return [], f"❌ {type(e).__name__}: {e}"
-
-
 def ui():
     with gr.Blocks(title="Colabvid") as app:
-        gr.Markdown(
-            """# 🎬 Colabvid
-### Full movie → Instagram Reels → Telegram"""
-        )
+        gr.Markdown("""# 🎬 Colabvid
+### Video → Fixed-length Instagram Clips → Telegram""")
 
         with gr.Row():
             with gr.Column():
                 source_mode = gr.Radio(
                     ["Upload", "URL"],
-                    value="Upload",
+                    value="URL",
                     label="Source",
                 )
                 upload = gr.File(
                     label="Video file",
                     file_types=["video"],
                     type="filepath",
+                    visible=False,
                 )
                 url = gr.Textbox(
                     label="Video URL",
-                    placeholder="https://...",
-                    visible=False,
+                    placeholder="Paste your video URL here...",
+                    visible=True,
                 )
-
                 target = gr.Slider(
-                    30, 90, value=60, step=1,
-                    label="Target clip duration (seconds)",
-                )
-                minimum = gr.Slider(
-                    15, 60, value=25, step=1,
-                    label="Minimum clip duration",
-                )
-                maximum = gr.Slider(
-                    60, 120, value=90, step=1,
-                    label="Maximum clip duration",
+                    15, 180, value=60, step=5,
+                    label="Clip duration (seconds)",
                 )
 
             with gr.Column():
-                subtitles = gr.Checkbox(
-                    False,
-                    label="Add local Whisper subtitles",
-                )
-                whisper_model = gr.Dropdown(
-                    ["tiny", "base", "small", "medium"],
-                    value="small",
-                    label="Whisper model",
-                )
-
                 send_telegram = gr.Checkbox(
                     False,
-                    label="Upload finished clips to Telegram",
+                    label="Upload clips to Telegram",
                 )
-                api_id = gr.Textbox(
-                    label="Telegram API_ID",
-                    type="password",
-                )
-                api_hash = gr.Textbox(
-                    label="Telegram API_HASH",
-                    type="password",
-                )
-                bot_token = gr.Textbox(
-                    label="Telegram BOT_TOKEN",
-                    type="password",
-                )
-                channel_id = gr.Textbox(
-                    label="Telegram CHANNEL_ID",
-                )
-                caption = gr.Textbox(
-                    value="Part {part}",
-                    label="Telegram caption",
-                )
+                api_id = gr.Textbox(label="Telegram API_ID", type="password")
+                api_hash = gr.Textbox(label="Telegram API_HASH", type="password")
+                bot_token = gr.Textbox(label="Telegram BOT_TOKEN", type="password")
+                channel_id = gr.Textbox(label="Telegram CHANNEL_ID")
+                caption = gr.Textbox(value="Part {part}", label="Telegram caption")
 
-        create = gr.Button(
-            "🚀 CREATE REELS",
-            variant="primary",
-            size="lg",
-        )
-        files = gr.File(
-            label="Generated clips",
-            file_count="multiple",
-        )
-        status = gr.Textbox(
-            label="Status",
-            interactive=False,
-        )
+        create = gr.Button("🚀 CREATE CLIPS", variant="primary", size="lg")
+        files = gr.File(label="Generated clips", file_count="multiple")
+        status = gr.Textbox(label="Status", interactive=False)
 
         def toggle_source(mode):
             return (
@@ -484,21 +333,14 @@ def ui():
                 gr.update(visible=mode == "URL"),
             )
 
-        source_mode.change(
-            toggle_source,
-            source_mode,
-            [upload, url],
-        )
+        source_mode.change(toggle_source, source_mode, [upload, url])
 
         create.click(
             process,
             inputs=[
-                source_mode, upload, url,
-                target, minimum, maximum,
-                subtitles, whisper_model,
-                send_telegram,
-                api_id, api_hash, bot_token, channel_id,
-                caption,
+                source_mode, upload, url, target,
+                send_telegram, api_id, api_hash, bot_token,
+                channel_id, caption,
             ],
             outputs=[files, status],
         )
