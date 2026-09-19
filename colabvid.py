@@ -12,7 +12,7 @@
 # - Scene-aware clip planning
 # - 9:16 rendering
 # - Local Whisper subtitles
-# - Telegram Bot API upload
+# - Telegram MTProto upload via Telethon (API ID + API HASH + bot token)
 #
 # Does NOT bypass DRM, CAPTCHA, login, paywalls or anti-bot controls.
 
@@ -164,74 +164,22 @@ def subtitles(video, srt, model="small"):
             t=(z.get("text") or "").strip()
             if t: f.write(f"{i}\n{ts(z['start'])} --> {ts(z['end'])}\n{t}\n\n")
 
-def telegram_bot(token, channel, file, caption):
-    if Path(file).stat().st_size > 50*1024*1024:
-        raise ValueError("Telegram Bot API sendVideo limit is 50 MB for this upload.")
-    with open(file,"rb") as f:
-        r=requests.post(f"https://api.telegram.org/bot{token}/sendVideo",
-                        data={"chat_id":channel,"caption":caption[:1024],"supports_streaming":"true"},
-                        files={"video":(Path(file).name,f,"video/mp4")},timeout=600)
-    if not r.ok: raise RuntimeError(f"Telegram upload failed: {r.text}")
-    return r.json()
+TELEGRAM_CLIENT = None
 
-def process(source_mode, upload, url, target, minimum, maximum, threshold,
-            use_subtitles, whisper_model, telegram, bot_token, channel_id, caption, progress=None):
-    def p(v,d):
-        print(d)
-        if progress: progress(v,desc=d)
-    if source_mode=="Upload":
-        if not upload: raise ValueError("Upload a video first.")
-        src=Path(upload); media=ffprobe(src)
-    else:
-        src,media=download(url, lambda v,d:p(.1*v,d))
-    p(.22,"Detecting scenes...")
-    sc=scenes(src,threshold)
-    clips=plan_clips(sc,media["duration"],int(target),int(minimum),int(maximum))
-    job=OUTPUTS/time.strftime("%Y%m%d_%H%M%S"); job.mkdir(parents=True)
-    result=[]
-    for i,(a,b) in enumerate(clips,1):
-        p(.25+.65*(i-1)/len(clips),f"Rendering Part {i:02d}/{len(clips)}...")
-        raw=job/f"Part_{i:02d}.source.mp4"; out=job/f"Part_{i:02d}.mp4"
-        render(src,a,b,raw)
-        if use_subtitles:
-            srt=job/f"Part_{i:02d}.srt"; subtitles(raw,srt,whisper_model)
-            render(raw,0,b-a,out,srt); raw.unlink(missing_ok=True); srt.unlink(missing_ok=True)
-        else: raw.replace(out)
-        result.append(str(out))
-        if telegram:
-            cap=caption.replace("{part}",f"{i:02d}").replace("{total}",str(len(clips)))
-            p(.25+.65*i/len(clips),f"Uploading Part {i:02d}...")
-            telegram_bot(bot_token,channel_id,out,cap)
-    p(1,"Finished.")
-    return result, f"Done — {len(result)} clips created. Output: {job}"
+def telegram_mtproto(api_id, api_hash, bot_token, channel, file, caption):
+    if not api_id or not api_hash or not bot_token or not channel:
+        raise ValueError("Telegram requires API_ID, API_HASH, BOT_TOKEN and CHANNEL_ID.")
+    from telethon import TelegramClient
+    global TELEGRAM_CLIENT
+    if TELEGRAM_CLIENT is None:
+        TELEGRAM_CLIENT = TelegramClient(str(ROOT / "telegram_bot_session"), int(api_id), api_hash)
+        TELEGRAM_CLIENT.start(bot_token=bot_token)
+    result = TELEGRAM_CLIENT.send_file(
+        channel,
+        file,
+        caption=caption[:1024],
+        supports_streaming=True,
+        video=True
+    )
+    return result
 
-def ui():
-    import gradio as gr
-    with gr.Blocks(title="Colabvid",theme=gr.themes.Soft()) as app:
-        gr.Markdown("# 🎬 Colabvid\n### Movie → Instagram Reels → Telegram\nNo AI API key required.")
-        source=gr.Radio(["Upload","URL"],value="Upload",label="Video source")
-        up=gr.File(label="Video",file_types=["video"],type="filepath")
-        url=gr.Textbox(label="Video URL",placeholder="R2/CDN/Pixeldrain/direct URL",visible=False)
-        source.change(lambda x:(gr.update(visible=x=="Upload"),gr.update(visible=x=="URL")),source,[up,url])
-        with gr.Row():
-            target=gr.Slider(30,90,60,5,label="Target clip seconds")
-            minimum=gr.Slider(10,60,25,5,label="Minimum clip seconds")
-            maximum=gr.Slider(45,120,90,5,label="Maximum clip seconds")
-            threshold=gr.Slider(10,60,27,1,label="Scene sensitivity")
-        with gr.Row():
-            subs=gr.Checkbox(True,label="Local Whisper subtitles")
-            model=gr.Dropdown(["tiny","base","small","medium"],value="small",label="Whisper model")
-        tg=gr.Checkbox(True,label="Upload to Telegram")
-        with gr.Row():
-            token=gr.Textbox(label="BOT_TOKEN",type="password")
-            channel=gr.Textbox(label="CHANNEL_ID")
-        caption=gr.Textbox("🎬 Part {part}/{total}",label="Telegram caption")
-        go=gr.Button("🚀 CREATE REELS",variant="primary")
-        files=gr.File(label="Generated Reels",file_count="multiple")
-        status=gr.Markdown("Ready.")
-        go.click(process,[source,up,url,target,minimum,maximum,threshold,subs,model,tg,token,channel,caption],[files,status],show_progress="full")
-    return app
-
-if __name__=="__main__":
-    install()
-    ui().queue().launch(share=True,show_error=True,max_file_size="20gb")
