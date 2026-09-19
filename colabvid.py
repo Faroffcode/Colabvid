@@ -126,7 +126,7 @@ def clip_buttons():
     ]
 
 async def render_clip(source, start, end, output, progress_callback=None):
-    vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+    vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"
     duration = max(0.1, end - start)
     log(f"Clipping: {output.name} ({start:.1f}s -> {end:.1f}s)")
     cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(source), "-t", str(duration),
