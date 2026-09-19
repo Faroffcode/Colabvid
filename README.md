@@ -18,6 +18,8 @@ Colabvid is a Telegram-controlled video processing bot. Send it a supported publ
 - 📱 Fixed 9:16 vertical output at 1080×1920
 - 🖼️ Full-frame preservation with dark/black padding instead of hard cropping
 - ⚡ Automatic NVIDIA NVENC detection with CPU fallback
+- 🔀 Pipelined encoding + Telegram uploading — the next clip can encode while the previous clip uploads
+- 📦 Bounded upload queue so a fast encoder can queue finished clips without filling Colab storage
 - 🔁 Automatic retry for downloads, rendering, and Telegram uploads
 - ♻️ Resume interrupted jobs with `/resume`
 - 💾 Persistent per-job progress using `job.json`
@@ -38,9 +40,10 @@ Colabvid is a Telegram-controlled video processing bot. Send it a supported publ
 6. Choose the number of clips.
 7. Colabvid downloads and probes the source video.
 8. Clips are rendered as 1080×1920 vertical videos while preserving the full frame.
-9. Each finished clip is uploaded directly to the configured Telegram channel.
-10. Progress is saved after every successful upload.
-11. Temporary files are automatically removed after the complete job succeeds.
+9. Finished clips enter a bounded upload queue; encoding continues while Telegram uploads the previous clip.
+10. Each finished clip is uploaded directly to the configured Telegram channel.
+11. Progress is saved after every successful upload.
+12. Temporary files are automatically removed after the complete job succeeds.
 
 If a job is interrupted, start the bot again and send `/resume` to continue from the saved progress.
 
@@ -83,11 +86,21 @@ Colabvid checks for an available NVIDIA GPU/NVENC encoder when the bot starts.
 
 The encoder is detected once per Colab session.
 
+### Upload queue
+
+The encoder and uploader run as a pipeline. By default, up to **2 finished clips** can wait in the upload queue. If encoding is faster than Telegram uploading, the encoder fills the queue and then waits for upload space instead of generating unlimited temporary files.
+
+Set `COLABVID_QUEUE_SIZE` to a value from **1 to 5** to control the queue size. Example: `COLABVID_QUEUE_SIZE=3`.
+
 ## 📊 Progress
 
 Telegram status messages are refreshed approximately every **2 seconds** during download and encoding.
 
 Progress can include:
+
+- Pipeline state (encoding/uploading)
+- Upload queue depth
+- Current and average upload speed
 
 - Download percentage and transferred size
 - Download speed
