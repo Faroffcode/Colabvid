@@ -144,7 +144,7 @@ def clip_buttons():
 
 def sanitize_filename(name):
     name = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", name.strip())
-    name = re.sub(r"[\\/:*?"<>|\x00-\x1f]+", "_", name)
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name)
     name = re.sub(r"\s+", " ", name).strip(" .")
     if not name:
         raise ValueError("File name cannot be empty.")
